@@ -216,15 +216,20 @@ class OdysseyGasResponse:
       return 0.0
 
     drivetrain = (gear, shift_activity)
-    if drivetrain != self.drivetrain or (self.pitch_peak is not None and pitch < self.pitch_peak - 0.01):
+    if drivetrain != self.drivetrain:
       self.clear_observer()
+    elif self.pitch_peak is not None and pitch < self.pitch_peak - 0.01:
+      # Falling grade can invalidate added gas, but should not erase overacceleration feedback.
+      if self.integral > 0.0:
+        self.clear_observer()
+      self.pitch_peak = pitch
     self.drivetrain = drivetrain
     self.pitch_peak = pitch if self.pitch_peak is None else max(self.pitch_peak, pitch)
     self.requests.append(request)
 
     response_gain = ODYSSEY_RESPONSE_COUNTS_PER_ACCEL + (ODYSSEY_RESPONSE_CAPPED_COUNTS_PER_ACCEL -
                                                         ODYSSEY_RESPONSE_COUNTS_PER_ACCEL) * float(np.clip(cap_weight, 0.0, 1.0))
-    # Fresh feedback uses mapped headroom; warmup retains a bounded positive offset.
+    # Fresh feedback and warmup use the mapped headroom.
     lower = limits[0]
     upper = limits[1]
     target = 0.0
@@ -243,12 +248,15 @@ class OdysseyGasResponse:
       target = float(np.clip(proportional + self.integral, lower, upper))
     else:
       # Observed excess acceleration can reduce gas before the delayed observer is ready.
-      target = float(np.clip(response_gain * min(request - aego, 0.0), lower, 0.0))
-      # Keep issued gas while the new observer warms only if the current response still needs it.
-      if request >= aego:
-        target = float(np.clip(self.correction, 0.0, upper))
-      # Seed feedback from the held command within its retained-offset bound.
-      self.integral = min(max(target, 0.0), ODYSSEY_RESPONSE_MAX_COUNTS)
+      proportional = float(np.clip(response_gain * min(request - aego, 0.0), lower, 0.0))
+      target = float(np.clip(self.correction, lower, upper))
+      # Retain issued correction unless the current error asks for the opposite direction.
+      if (request - aego) * target < 0.0:
+        target = 0.0
+      if request < aego:
+        target = min(target, proportional)
+      # Seed the offset after accounting for the current proportional reduction.
+      self.integral = target - proportional
     self.correction = float(np.clip(target, self.correction - ODYSSEY_RESPONSE_SLEW_COUNTS,
                                      self.correction + ODYSSEY_RESPONSE_SLEW_COUNTS))
     return self.correction
@@ -1526,6 +1534,9 @@ class CarController(CarControllerBase, MadsCarController, GasInterceptorCarContr
             coast_state_valid = (gear_state_valid and
                                  CS.odyssey_computer_braking_ts_nanos > 0 and
                                  0 <= now_nanos - CS.odyssey_computer_braking_ts_nanos < 60_000_000)
+            # Brake feedback may remain active after the computer-braking bit clears.
+            brake_feedback_active = (CS.odyssey_computer_braking or
+                                     (math.isfinite(CS.odyssey_user_brake) and CS.odyssey_user_brake > 0.015625))
             passive_accel = self.odyssey_coast_response.update(
               self.frame, CS.odyssey_target_gear, CC.orientationNED[1] if odyssey_pitch_valid else 0.0, CS.out.aEgo,
               # A nonnegative brake hold is controlled response, not a passive coast observation.
@@ -1543,11 +1554,11 @@ class CarController(CarControllerBase, MadsCarController, GasInterceptorCarContr
               now_nanos, accel, CS.out.aEgo, self.odyssey_brake_selected, CS.odyssey_computer_braking_ts_nanos,
               CS.odyssey_car_gas, CS.odyssey_target_gear,
               coast_eligible and coast_state_valid and CS.out.vEgo >= 8.0 and
-              (not self.odyssey_brake_selected or CS.odyssey_computer_braking),
+              (not self.odyssey_brake_selected or brake_feedback_active),
               passive_accel)
-            # Idle brakes and a positive-request shortfall supersede a held coast forecast.
+            # Observed shortfall invalidates a positive-request brake hold.
             release_brake |= (settled_brake and accel > 0.0 and CS.odyssey_car_gas == 0.0 and
-                              not CS.odyssey_computer_braking and abs(CS.odyssey_user_brake) <= 0.015625 and
+                              math.isfinite(CS.odyssey_user_brake) and
                               CS.out.aEgo < accel - ODYSSEY_COAST_RELEASE_ERROR)
             gas_accel = accel
             cap_weight = 0.0
@@ -1562,14 +1573,21 @@ class CarController(CarControllerBase, MadsCarController, GasInterceptorCarContr
                              self.frame - coast_start >= 2 * ODYSSEY_RESPONSE_DELAY_FRAMES)
             response_excess = (self.odyssey_gas_response.drivetrain == (CS.odyssey_target_gear, CS.odyssey_shift_activity) and
                                self.odyssey_gas_response.error.x < -ODYSSEY_COAST_RELEASE_ERROR)
-            passive_gas = (passive_response_eligible and accel < 0.0 and passive_accel < accel and
+            response_gas = (passive_response_eligible and accel < 0.0 and passive_accel < accel and
                            not CS.odyssey_computer_braking and
                            ((previous_gas and (CS.out.aEgo <= accel + ODYSSEY_COAST_RELEASE_ERROR or
                                               (not response_excess and not self.odyssey_gas_bridge_active))) or
                             (passive_accel < accel - ODYSSEY_COAST_RELEASE_ERROR and
                              CS.odyssey_car_gas == 0.0 and CS.out.aEgo < accel - ODYSSEY_COAST_RELEASE_ERROR and
                              (settled_coast or settled_brake))))
-            if passive_gas:
+            # Retain needed feedback at the map floor through drivetrain observer warmup.
+            response_gas |= (previous_gas and not self.odyssey_gas_bridge_active and
+                            coast_eligible and coast_state_valid and not brake_feedback_active and
+                            8.0 <= CS.out.vEgo <= 35.0 and accel < 0.0 and
+                            (passive_accel is None or passive_accel < accel) and
+                            self.odyssey_gas_response.correction > 0.0 and
+                            CS.out.aEgo <= accel + ODYSSEY_COAST_RELEASE_ERROR)
+            if response_gas:
               gas_selected, brake_selected = True, False
               self.odyssey_gas_bridge_active = False
             # A prior coast forecast and fresh response can establish brake need before the learning dwell.
@@ -1586,9 +1604,7 @@ class CarController(CarControllerBase, MadsCarController, GasInterceptorCarContr
                                                                       passive_accel if passive_response_eligible else None)
             # A released brake command can precede the received brake feedback returning to idle.
             waiting_for_brake_release = (gas_selected and not previous_gas and coast_eligible and coast_state_valid and
-                                         8.0 <= CS.out.vEgo <= 35.0 and
-                                         (CS.odyssey_computer_braking or
-                                          (math.isfinite(CS.odyssey_user_brake) and CS.odyssey_user_brake > 0.015625)))
+                                         8.0 <= CS.out.vEgo <= 35.0 and brake_feedback_active)
             if waiting_for_brake_release:
               gas_selected = False
             # Keep settled brake history through qualified coast and the feedback wait.
@@ -1605,7 +1621,7 @@ class CarController(CarControllerBase, MadsCarController, GasInterceptorCarContr
                                  not self.odyssey_gas_bridge_active and odyssey_pitch_valid and
                                  actuators.longControlState == LongCtrlState.pid and
                                  not CS.out.gasPressed and not CS.out.brakePressed and
-                                 gear_state_valid and (self.gas > 0.0 or passive_gas))
+                                 gear_state_valid and (self.gas > 0.0 or response_gas))
             available_gas = odyssey_low_speed_gas_command(self.gas, accel, CS.out.vEgo)
             correction = self.odyssey_gas_response.update(accel, CS.out.aEgo, self.odyssey_pitch.x,
                                                             CS.out.vEgo, CS.odyssey_target_gear, feedback_eligible,
@@ -1619,7 +1635,7 @@ class CarController(CarControllerBase, MadsCarController, GasInterceptorCarContr
               self.accel = odyssey_creep_brake_accel(self.accel, CS.out.vEgo)
             # A qualified passive-response shortfall can use gas and existing feedback at the map floor.
             self.gas, self.odyssey_gas_bridge_active = odyssey_gas_command(accel, self.gas, gas_selected,
-                                                                            previous_gas or passive_gas, self.odyssey_gas_bridge_active,
+                                                                            previous_gas or response_gas, self.odyssey_gas_bridge_active,
                                                                             bridge_weight)
             gas_domain = gas_selected
             brake_domain = brake_selected
