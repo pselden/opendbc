@@ -57,37 +57,6 @@ ODYSSEY_ROAD_BRAKE_ENTRY = -0.30
 ODYSSEY_LOAD_PRESET_PARAM = "OdysseyLoadPreset"
 ODYSSEY_LOAD_FACTORS = (1.0, 1.15, 1.25)
 ODYSSEY_LOAD_REFRESH_FRAMES = 200  # re-read the preset every 2 s so a change applies mid-drive
-ODYSSEY_LKA_STEER_MAX = 2560
-ODYSSEY_STEER_ERROR_MIN = 0.10
-ODYSSEY_STEER_ERROR_FRAMES = 20
-
-
-class OdysseySteeringAuthority:
-  """Open the extra steering range only for persistent same-direction tracking error."""
-  def __init__(self):
-    self.error_frames = 0
-    self.direction = 0
-
-  def limit(self, requested, curvature, current_curvature, speed, eligible, maximum):
-    desired_accel = curvature * speed * speed
-    error = (curvature - current_curvature) * speed * speed
-    direction = int(np.sign(requested))
-    qualified = (eligible and 15.0 <= speed <= 33.0 and
-                 abs(requested) >= ODYSSEY_LKA_STEER_MAX and
-                 desired_accel * direction > 0.0 and
-                 math.isfinite(error) and math.isfinite(desired_accel))
-    if not qualified or direction != self.direction:
-      self.error_frames = 0
-    self.direction = direction if qualified else 0
-    # Once qualified, the continuing upstream request controls torque through convergence.
-    if qualified and error * direction > ODYSSEY_STEER_ERROR_MIN:
-      self.error_frames += 1
-    elif self.error_frames < ODYSSEY_STEER_ERROR_FRAMES:
-      self.error_frames = 0
-    limit = maximum if self.error_frames >= ODYSSEY_STEER_ERROR_FRAMES else ODYSSEY_LKA_STEER_MAX
-    return float(np.clip(requested, -limit, limit))
-
-
 def odyssey_command_domains(accel, speed, previous_brake=False, previous_gas=False, bridge_active=False,
                             gas_accel=None, release_brake=False, release_gas=False, passive_accel=None):
   """Keep low-speed stop authority and separate road-speed coast from friction braking."""
@@ -614,7 +583,6 @@ class CarController(CarControllerBase, MadsCarController, GasInterceptorCarContr
     self.last_applied_brake = 0.0
 
     # brikowski/opendbc Odyssey command-following controller state
-    self.odyssey_steering_authority = OdysseySteeringAuthority() if CP.carFingerprint == CAR.HONDA_ODYSSEY_5G_MMR else None
     self.odyssey_brake_selected = False
     self.odyssey_brake_start_frame = None
     self.odyssey_gas_selected = False
@@ -963,14 +931,11 @@ class CarController(CarControllerBase, MadsCarController, GasInterceptorCarContr
       if abs(limited_torque) < 0.9 and self.latFactors[currentLatSpeed] < abs(CS.out.steeringAngleDeg):
         self.latFactors[currentLatSpeed] *= 1.001
     if self.CP.carFingerprint == CAR.HONDA_ODYSSEY_5G_MMR:
-      requested = -actuators.torque * self.params.STEER_MAX
-      target = self.odyssey_steering_authority.limit(requested, actuators.curvature, CC.currentCurvature,
-                                                     CS.out.vEgo,
-                                                     CC.latActive and not CS.out.steeringPressed and
-                                                     not CS.out.steerFaultTemporary and not CS.out.steerFaultPermanent,
-                                                     self.params.STEER_MAX)
+      # brikowski ody-op-test cef93020: the full 3840 range is always available. The tune is rescaled in the
+      # interface, so counts per m/s^2 and the slew in counts per frame are the stock 2560-range values.
+      requested = float(np.clip(-actuators.torque, -1.0, 1.0)) * self.params.STEER_MAX
       physical_slew = self.params.STEER_DELTA_UP * DT_CTRL * self.params.STEER_MAX
-      apply_torque = int(rate_limit(target, -previous_torque * self.params.STEER_MAX,
+      apply_torque = int(rate_limit(requested, -previous_torque * self.params.STEER_MAX,
                                     -physical_slew, physical_slew)) if CC.latActive else 0
       self.last_torque = -apply_torque / self.params.STEER_MAX
 

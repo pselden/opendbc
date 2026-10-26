@@ -16,10 +16,9 @@ from opendbc.car.honda.carcontroller import (ODYSSEY_GAS_BRIDGE_COMMAND, ODYSSEY
                                              ODYSSEY_ZERO_GAS_GRADE_GAIN,
                                              ODYSSEY_RESPONSE_CAPPED_COUNTS_PER_ACCEL, ODYSSEY_RESPONSE_COUNTS_PER_ACCEL,
                                              ODYSSEY_RESPONSE_DELAY_FRAMES, ODYSSEY_RESPONSE_MAX_COUNTS, ODYSSEY_RESPONSE_SLEW_COUNTS,
-                                             ODYSSEY_ROAD_BRAKE_ENTRY, ODYSSEY_STEER_ERROR_FRAMES,
+                                             ODYSSEY_ROAD_BRAKE_ENTRY,
                                              ODYSSEY_UPHILL_GAS_ACCEL_MAX, ODYSSEY_LOAD_FACTORS, CarController,
                                              odyssey_brake_release, odyssey_load_factor, odyssey_load_gas_accel,
-                                             OdysseySteeringAuthority,
                                              OdysseyCoastResponse, OdysseyGasCoastRelease, OdysseyGasResponse,
                                              odyssey_command_domains, odyssey_gas_command, odyssey_grade_weight,
                                              odyssey_creep_brake_accel, odyssey_low_speed_gas_command,
@@ -52,7 +51,7 @@ class SimpleNamespace(_SimpleNamespace):
       SimpleNamespace._defaults = CarState(CP, _sp(CP))
     return getattr(SimpleNamespace._defaults, name)
 
-class TestOdysseySteeringAuthority(unittest.TestCase):
+class TestOdysseySteeringRange(unittest.TestCase):
   def test_parameter_rescaling_preserves_ordinary_physical_map(self):
     CP = CarInterface.get_params(CAR.HONDA_ODYSSEY_5G_MMR, gen_empty_fingerprint(), [], True, False, False)
     params = CarControllerParams(CP)
@@ -64,113 +63,6 @@ class TestOdysseySteeringAuthority(unittest.TestCase):
       old_count = (demand + 0.2 * 0.9) / 0.9 * 2560
       new_count = (demand + CP.lateralTuning.torque.friction * CP.lateralTuning.torque.latAccelFactor) / CP.lateralTuning.torque.latAccelFactor * 3840
       self.assertAlmostEqual(old_count, new_count, delta=0.01)
-
-  def test_extra_range_requires_persistent_same_direction_error(self):
-    authority = OdysseySteeringAuthority()
-    curvature = 1.8 / 31.0**2
-    current = curvature - 0.3 / 31.0**2
-    for _ in range(ODYSSEY_STEER_ERROR_FRAMES - 1):
-      self.assertEqual(authority.limit(3500, curvature, current, 31.0, True, 3840), 2560)
-    self.assertGreater(authority.limit(3500, curvature, current, 31.0, True, 3840), 2560)
-    self.assertEqual(authority.limit(3500, curvature, current, 14.9, True, 3840), 2560)
-    lower_curvature = 1.8 / 22.0**2
-    lower_current = lower_curvature - 0.3 / 22.0**2
-    for _ in range(ODYSSEY_STEER_ERROR_FRAMES - 1):
-      self.assertEqual(authority.limit(3500, lower_curvature, lower_current, 22.0, True, 3840), 2560)
-    self.assertGreater(authority.limit(3500, lower_curvature, lower_current, 22.0, True, 3840), 2560)
-    self.assertEqual(authority.limit(3500, curvature, current, 31.0, False, 3840), 2560)
-    self.assertEqual(authority.limit(-3500, -curvature, -current, 31.0, True, 3840), -2560)
-    self.assertEqual(authority.limit(3500, -curvature, -current, 31.0, True, 3840), 2560)
-    self.assertEqual(authority.limit(3500, curvature, curvature, 31.0, True, 3840), 2560)
-    self.assertEqual(authority.limit(2000, curvature, current, 31.0, True, 3840), 2000)
-
-  def test_steering_authority_speed_scope(self):
-    for direction in (-1, 1):
-      for speed in (8.5, 14.9, 15.0, 16.5, 19.9, 20.0, 33.0, 33.1):
-        with self.subTest(direction=direction, speed=speed):
-          authority = OdysseySteeringAuthority()
-          curvature = direction * 1.5 / speed**2
-          current = curvature - direction * 0.4 / speed**2
-          for _ in range(ODYSSEY_STEER_ERROR_FRAMES):
-            output = authority.limit(direction * 3500, curvature, current, speed, True, 3840)
-          if 15.0 <= speed <= 33.0:
-            self.assertGreater(abs(output), 2560)
-          else:
-            self.assertEqual(abs(output), 2560)
-
-  def test_qualified_authority_follows_requested_torque(self):
-    for direction in (-1, 1):
-      for error in (0.11, 0.18, 0.3, 0.7):
-        with self.subTest(direction=direction, error=error):
-          authority = OdysseySteeringAuthority()
-          speed = 22.0
-          curvature = direction * 1.8 / speed**2
-          current = curvature - direction * error / speed**2
-          for _ in range(ODYSSEY_STEER_ERROR_FRAMES):
-            output = authority.limit(direction * 3500, curvature, current, speed, True, 3840)
-          self.assertEqual(output, direction * 3500)
-          self.assertEqual(authority.limit(direction * 4200, curvature, current, speed, True, 3840), direction * 3840)
-          self.assertEqual(authority.limit(direction * 2700, curvature, current, speed, True, 3840), direction * 2700)
-          # Convergence leaves the controller's continuing request in charge of torque.
-          for remaining_error in (0.09, 0.0, -0.2):
-            current = curvature - direction * remaining_error / speed**2
-            self.assertEqual(authority.limit(direction * 3500, curvature, current, speed, True, 3840), direction * 3500)
-          # Falling demand closes the gate; a renewed request must qualify again.
-          self.assertEqual(authority.limit(direction * 2000, curvature, current, speed, True, 3840), direction * 2000)
-          self.assertEqual(authority.limit(direction * 3500, curvature, current, speed, True, 3840), direction * 2560)
-          # Countersteering error must not grant authority against the planned turn.
-          for _ in range(ODYSSEY_STEER_ERROR_FRAMES):
-            output = authority.limit(direction * 3500, -curvature, -curvature - direction * error / speed**2, speed, True, 3840)
-          self.assertEqual(output, direction * 2560)
-
-  def test_extra_range_does_not_withdraw_on_growing_turn_demand(self):
-    for direction in (-1, 1):
-      with self.subTest(direction=direction):
-        authority = OdysseySteeringAuthority()
-        speed = 31.5
-
-        def command(demand, error, direction=direction, speed=speed, authority=authority):
-          curvature = direction * demand / speed**2
-          current = curvature - direction * error / speed**2
-          return authority.limit(direction * 3840, curvature, current, speed, True, 3840)
-
-        for _ in range(ODYSSEY_STEER_ERROR_FRAMES):
-          command(2.4, 0.7)
-        self.assertEqual(command(2.4, 0.7), direction * 3840)
-        self.assertEqual(command(2.6, 0.7), direction * 3840)
-        self.assertEqual(command(3.1, 1.0), direction * 3840)
-        self.assertEqual(command(3.1, 0.0), direction * 3840)
-
-  def test_qualified_authority_closes_on_ineligible_state(self):
-    for direction in (-1, 1):
-      speed = 22.0
-      curvature = direction * 1.8 / speed**2
-      current = curvature - direction * 0.3 / speed**2
-      for changed in ({'speed': 14.9}, {'speed': 33.1}, {'speed': math.nan}, {'eligible': False},
-                      {'curvature': 0.0}, {'curvature': -curvature}, {'current_curvature': math.nan},
-                      {'requested': -direction * 3500}, {'requested': direction * 2500}):
-        with self.subTest(direction=direction, changed=changed):
-          authority = OdysseySteeringAuthority()
-          args = dict(requested=direction * 3500, curvature=curvature, current_curvature=current,
-                      speed=speed, eligible=True, maximum=3840)
-          for _ in range(ODYSSEY_STEER_ERROR_FRAMES):
-            authority.limit(**args)
-          self.assertEqual(authority.limit(**args), direction * 3500)
-          output = authority.limit(**(args | changed))
-          self.assertLessEqual(abs(output), 2560)
-          self.assertEqual(authority.error_frames, 0)
-          self.assertEqual(authority.limit(**args), direction * 2560)
-
-  def test_qualification_requires_consecutive_error(self):
-    authority = OdysseySteeringAuthority()
-    speed = 22.0
-    curvature = 1.8 / speed**2
-    for _ in range(ODYSSEY_STEER_ERROR_FRAMES - 1):
-      self.assertEqual(authority.limit(3500, curvature, curvature - 0.3 / speed**2, speed, True, 3840), 2560)
-    self.assertEqual(authority.limit(3500, curvature, curvature, speed, True, 3840), 2560)
-    for _ in range(ODYSSEY_STEER_ERROR_FRAMES - 1):
-      self.assertEqual(authority.limit(3500, curvature, curvature - 0.3 / speed**2, speed, True, 3840), 2560)
-    self.assertEqual(authority.limit(3500, curvature, curvature - 0.3 / speed**2, speed, True, 3840), 3500)
 
   def test_steering_wire_preserves_persistent_request_through_ramp_and_turn_exit(self):
     from opendbc.safety.tests.libsafety import libsafety_py
@@ -220,58 +112,50 @@ class TestOdysseySteeringAuthority(unittest.TestCase):
         self.assertEqual(abs(counts[-1]), 1920)
         self.assertLessEqual(max(abs(b - a) for a, b in zip(counts, counts[1:], strict=False)), 77)
 
-  def test_steering_wire_and_output_follow_bounded_authority_in_both_bus_modes(self):
-    for alpha_long, bus, speed in ((True, 1, 31.0), (False, 0, 31.0), (True, 1, 22.0), (False, 0, 22.0),
-                                  (True, 1, 16.5), (False, 0, 16.5)):
-      with self.subTest(alpha_long=alpha_long, speed=speed):
-        CP = CarInterface.get_params(CAR.HONDA_ODYSSEY_5G_MMR, gen_empty_fingerprint(), [], alpha_long, False, False)
-        dbc = DBC[CP.carFingerprint][Bus.pt]
-        controller = CarController({Bus.pt: dbc}, CP, _sp(CP))
-        parser = CANParser(dbc, [('STEERING_CONTROL', 0)], bus)
-        control = structs.CarControl()
-        control.enabled = True
-        control.latActive = True
-        control.actuators.torque = -1.0
-        control.actuators.curvature = 1.8 / speed**2
-        control.currentCurvature = control.actuators.curvature - 0.3 / speed**2
-        state = structs.CarState()
-        state.vEgo = speed
-        CS = SimpleNamespace(out=state, v_cruise_factor=0.44704, is_metric=False, acc_hud={}, lkas_hud={}, stock_brake={},
-                             odyssey_car_gas=math.nan,
-                             odyssey_engine_torque_ts_nanos=0, odyssey_shift_activity=0, odyssey_target_gear=0,
-                             odyssey_user_brake=0., odyssey_computer_braking=False, odyssey_computer_braking_ts_nanos=0)
+  def test_full_range_at_every_speed_in_both_bus_modes(self):
+    # brikowski ody-op-test cef93020: no speed or tracking-error gate; the whole 3840 range is reachable
+    # at any speed, at the stock slew in counts per frame, and only while lateral is active.
+    for alpha_long, bus in ((True, 1), (False, 0)):
+      for speed in (3.0, 8.5, 14.9, 22.0, 31.0, 33.1, 38.0):
+        with self.subTest(alpha_long=alpha_long, speed=speed):
+          CP = CarInterface.get_params(CAR.HONDA_ODYSSEY_5G_MMR, gen_empty_fingerprint(), [], alpha_long, False, False)
+          dbc = DBC[CP.carFingerprint][Bus.pt]
+          controller = CarController({Bus.pt: dbc}, CP, _sp(CP))
+          parser = CANParser(dbc, [('STEERING_CONTROL', 0)], bus)
+          control = structs.CarControl()
+          control.enabled = True
+          control.latActive = True
+          control.actuators.torque = -1.0
+          control.actuators.curvature = 1.8 / speed**2
+          control.currentCurvature = control.actuators.curvature
+          state = structs.CarState()
+          state.vEgo = speed
+          CS = SimpleNamespace(out=state, v_cruise_factor=0.44704, is_metric=False, acc_hud={}, lkas_hud={}, stock_brake={},
+                               odyssey_car_gas=math.nan,
+                               odyssey_engine_torque_ts_nanos=0, odyssey_shift_activity=0, odyssey_target_gear=0,
+                               odyssey_user_brake=0., odyssey_computer_braking=False, odyssey_computer_braking_ts_nanos=0)
 
-        def step(frame, controller=controller, control=control, CS=CS, bus=bus, parser=parser):
-          output, sends = controller.update(control.as_reader(), structs.CarControlSP(), CS, frame * 10_000_000)
-          steering = [(addr, dat, src) for addr, dat, src in sends if addr == 0xE4]
-          self.assertEqual(len(steering), 1)
-          self.assertEqual(steering[0][2], bus)
-          parser.update([(frame * 10_000_000, steering)])
-          self.assertEqual(parser.vl['STEERING_CONTROL']['STEER_TORQUE'], output.torqueOutputCan)
-          self.assertAlmostEqual(output.torque, -output.torqueOutputCan / 3840, places=6)
-          return output.torqueOutputCan
+          def step(frame, controller=controller, control=control, CS=CS, bus=bus, parser=parser):
+            output, sends = controller.update(control.as_reader(), structs.CarControlSP(), CS, frame * 10_000_000)
+            steering = [(addr, dat, src) for addr, dat, src in sends if addr == 0xE4]
+            self.assertEqual(len(steering), 1)
+            self.assertEqual(steering[0][2], bus)
+            parser.update([(frame * 10_000_000, steering)])
+            self.assertEqual(parser.vl['STEERING_CONTROL']['STEER_TORQUE'], output.torqueOutputCan)
+            self.assertAlmostEqual(output.torque, -output.torqueOutputCan / 3840, places=6)
+            return output.torqueOutputCan
 
-        counts = [step(frame) for frame in range(200)]
-        self.assertLessEqual(max(abs(right - left) for left, right in zip(counts, counts[1:], strict=False)), 77)
-        self.assertEqual(counts[-1], 3840)
-        state.steerFaultTemporary = True
-        fault_release = [step(frame) for frame in range(200, 220)]
-        self.assertLessEqual(max(abs(right - left) for left, right in zip(fault_release, fault_release[1:], strict=False)), 77)
-        self.assertEqual(fault_release[-1], 2560)
-        state.steerFaultTemporary = False
-        for frame in range(220, 265):
-          step(frame)
-        state.steeringPressed = True
-        falling = [step(frame) for frame in range(265, 285)]
-        self.assertLessEqual(max(abs(right - left) for left, right in zip(falling, falling[1:], strict=False)), 77)
-        self.assertEqual(falling[-1], 2560)
-        state.steeringPressed = False
-        control.actuators.torque = 1.0
-        control.actuators.curvature *= -1
-        control.currentCurvature *= -1
-        self.assertLessEqual(step(285), 2560)
-        control.latActive = False
-        self.assertEqual(step(286), 0)
+          counts = [step(frame) for frame in range(80)]
+          self.assertLessEqual(max(abs(right - left) for left, right in zip(counts, counts[1:], strict=False)), 77)
+          self.assertEqual(counts[-1], 3840)
+          control.actuators.torque = -1.5  # out-of-range requests saturate at the range, never beyond
+          self.assertEqual(step(80), 3840)
+          control.actuators.torque = 1.0
+          reverse = [step(frame) for frame in range(81, 190)]
+          self.assertLessEqual(max(abs(right - left) for left, right in zip(reverse, reverse[1:], strict=False)), 77)
+          self.assertEqual(reverse[-1], -3840)
+          control.latActive = False
+          self.assertEqual(step(190), 0)
 
 
 class TestOdysseyLongitudinal(unittest.TestCase):
