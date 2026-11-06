@@ -1,5 +1,5 @@
-# Odyssey command-following tests ported from brikowski/opendbc (opendbc/car/honda/tests/test_honda.py @ 164b2fd).
-# Adapted to sunnypilot's CarParamsSP / CarControlSP API; test bodies are unchanged.
+# Odyssey command-following tests ported from brikowski/opendbc, with stable updates through c91503afe.
+# Adapted to sunnypilot's CarParamsSP / CarControlSP API and van-load scaling; native ECON cases are excluded.
 import math
 import subprocess
 import sys
@@ -11,9 +11,7 @@ from unittest.mock import patch
 from opendbc.can import CANPacker
 from opendbc.can.parser import CANParser
 from opendbc.car import ACCELERATION_DUE_TO_GRAVITY, DT_CTRL, Bus, gen_empty_fingerprint, structs
-from opendbc.car.honda.carcontroller import (ODYSSEY_GAS_BRIDGE_COMMAND, ODYSSEY_GRADE_GAIN,
-                                             ODYSSEY_GRADE_RAMP_ACCEL, ODYSSEY_LOW_SPEED_GAS_TRIM_COUNTS,
-                                             ODYSSEY_ZERO_GAS_GRADE_GAIN,
+from opendbc.car.honda.carcontroller import (ODYSSEY_GAS_BRIDGE_COMMAND, ODYSSEY_GRADE_GAIN, ODYSSEY_GRADE_RAMP_ACCEL, ODYSSEY_LOW_SPEED_GAS_TRIM_COUNTS,
                                              ODYSSEY_RESPONSE_CAPPED_COUNTS_PER_ACCEL, ODYSSEY_RESPONSE_COUNTS_PER_ACCEL,
                                              ODYSSEY_RESPONSE_DELAY_FRAMES, ODYSSEY_RESPONSE_MAX_COUNTS, ODYSSEY_RESPONSE_SLEW_COUNTS,
                                              ODYSSEY_ROAD_BRAKE_ENTRY,
@@ -163,17 +161,453 @@ class TestOdysseySteeringRange(unittest.TestCase):
 
 
 class TestOdysseyLongitudinal(unittest.TestCase):
+  def test_gas_calibration_is_independent_of_other_honda_interfaces(self):
+    original_bp = CarControllerParams.BOSCH_GAS_LOOKUP_BP
+    original_values = CarControllerParams.BOSCH_GAS_LOOKUP_V
+    try:
+      odyssey = CarInterface.get_params(CAR.HONDA_ODYSSEY_5G_MMR, gen_empty_fingerprint(), [], True, False, False)
+      params = CarControllerParams(odyssey)
+      other = CarInterface.get_params(CAR.ACURA_RDX_3G, gen_empty_fingerprint(), [], True, False, False)
+      other_params = CarControllerParams(other)
+      CarInterface.get_params(CAR.HONDA_ODYSSEY_5G_MMR, gen_empty_fingerprint(), [], True, False, False)
+      self.assertEqual(other_params.BOSCH_GAS_LOOKUP_V, [0, 2200])
+      for calibrated in (params, CarControllerParams(odyssey)):
+        self.assertEqual(calibrated.BOSCH_GAS_LOOKUP_BP, [-0.2, 2.0])
+        self.assertEqual(calibrated.BOSCH_GAS_LOOKUP_V, [0, 2000])
+    finally:
+      CarControllerParams.BOSCH_GAS_LOOKUP_BP = original_bp
+      CarControllerParams.BOSCH_GAS_LOOKUP_V = original_values
+
+  def test_grade_calibration_cannot_expand_unqualified_raw_gas_continuity(self):
+    gas_accel = odyssey_grade_gas_accel(-0.23, 0.03)
+    self.assertEqual(odyssey_command_domains(-0.23, 20.0, previous_gas=True, gas_accel=gas_accel), (False, False))
+    self.assertEqual(odyssey_command_domains(-0.23, 20.0, gas_accel=gas_accel), (False, False))
+    self.assertEqual(odyssey_command_domains(-0.23, 20.0, previous_gas=True, gas_accel=-0.23), (False, False))
+    self.assertEqual(odyssey_command_domains(-0.23, 20.0, previous_gas=True,
+                                              gas_accel=odyssey_grade_gas_accel(-0.23, 0.01)), (False, False))
+    self.assertEqual(odyssey_command_domains(-0.23, 20.0, previous_gas=True,
+                                              gas_accel=odyssey_grade_gas_accel(-0.23, 0.07)), (False, False))
+    self.assertEqual(odyssey_command_domains(-0.19, 20.0, previous_gas=True, gas_accel=-0.10), (True, False))
+    self.assertEqual(odyssey_command_domains(-0.19, 20.0, previous_gas=True, gas_accel=-0.23), (False, False))
+
+  def test_calibrated_uphill_gas_does_not_require_a_learned_offset(self):
+    CP = CarInterface.get_params(CAR.HONDA_ODYSSEY_5G_MMR, gen_empty_fingerprint(), [], True, False, False)
+    dbc = DBC[CP.carFingerprint][Bus.pt]
+    for econ, pitch, achieved in product((False,), (0., .08), (-.4, -.27, 0.)):
+      with self.subTest(econ=econ, pitch=pitch, achieved=achieved):
+        controller = CarController({Bus.pt: dbc}, CP, _sp(CP))
+        controller.frame = 100
+        controller.odyssey_eco_mode = econ
+        controller.odyssey_gas_selected = True
+        controller.odyssey_pitch.x = pitch
+        control = structs.CarControl(enabled=True, longActive=True, orientationNED=[0., pitch, 0.])
+        control.actuators.accel = -.27
+        control.actuators.longControlState = structs.CarControl.Actuators.LongControlState.pid
+        state = structs.CarState(vEgo=20., aEgo=achieved, canValid=True)
+        now = 2_000_000_000
+        CS = SimpleNamespace(out=state, v_cruise_factor=.44704, is_metric=False, acc_hud={}, lkas_hud={}, stock_brake={},
+                             odyssey_car_gas=0., odyssey_shift_activity=0, odyssey_target_gear=6,
+                             odyssey_user_brake=0., odyssey_computer_braking=False,
+                             odyssey_engine_torque_ts_nanos=now, odyssey_target_gear_ts_nanos=now,
+                             odyssey_computer_braking_ts_nanos=now)
+        output, sends = controller.update(control.as_reader(), structs.CarControlSP(), CS, now)
+        parser = CANParser(dbc, [('ACC_CONTROL', 0)], 1)
+        parser.update([(now, [m for m in sends if m[0] == 0x1DF])])
+        values = parser.vl['ACC_CONTROL']
+        self.assertEqual(values['BRAKE_REQUEST'], 0)
+        self.assertAlmostEqual(values['ACCEL_COMMAND'], control.actuators.accel, delta=.01)
+        self.assertAlmostEqual(output.accel, values['ACCEL_COMMAND'], delta=.01)
+        self.assertFalse(controller.odyssey_coast_response.drag)
+        self.assertEqual(controller.odyssey_gas_response.correction, 0.)
+        if pitch > 0. and state.aEgo <= control.actuators.accel:
+          self.assertGreater(values['GAS_COMMAND'], 0)
+        else:
+          self.assertEqual(values['GAS_COMMAND'], -30000)
+
+  def test_excess_passive_deceleration_above_stop_speed(self):
+    from opendbc.safety.tests.libsafety import libsafety_py
+
+    CP = CarInterface.get_params(CAR.HONDA_ODYSSEY_5G_MMR, gen_empty_fingerprint(), [], True, False, False)
+    dbc = DBC[CP.carFingerprint][Bus.pt]
+    safety = libsafety_py.libsafety
+    config = CP.safetyConfigs[-1]
+    self.assertEqual(safety.set_safety_hooks(config.safetyModel.raw, config.safetyParam), 0)
+    safety.init_tests()
+    safety.set_controls_allowed(True)
+    cases = ((-.1, -.45, -.45, False, True),
+             (-.1, -.1, -.45, False, False),
+             (-.6, -.45, -.45, False, False),
+             (-.1, -.45, None, False, False),
+             (-.1, -.45, -.05, False, False),
+             (-.1, -.45, -.45, True, False))
+    for speed, econ, (request, achieved, forecast, braking, needs_gas) in product((4.9, 5., 7.5, 20., 35.1), (False, True), cases):
+      with self.subTest(speed=speed, econ=econ, request=request, forecast=forecast, braking=braking, achieved=achieved):
+        controller = CarController({Bus.pt: dbc}, CP, _sp(CP))
+        controller.frame = 100
+        controller.odyssey_eco_mode = econ
+        controller.odyssey_brake_selected = True
+        controller.odyssey_brake_start_frame = 0
+        controller.odyssey_pitch.x = .05
+        controller.odyssey_coast_response.gear = 4
+        if forecast is not None:
+          controller.odyssey_coast_response.drag[4] = forecast + ACCELERATION_DUE_TO_GRAVITY * math.sin(.05)
+        control = structs.CarControl(enabled=True, longActive=True, orientationNED=[0., .05, 0.])
+        control.actuators.accel = request
+        control.actuators.longControlState = structs.CarControl.Actuators.LongControlState.pid
+        state = structs.CarState(vEgo=speed, aEgo=achieved, canValid=True)
+        now = 2_000_000_000
+        CS = SimpleNamespace(out=state, v_cruise_factor=.44704, is_metric=False, acc_hud={}, lkas_hud={}, stock_brake={},
+                             odyssey_car_gas=0., odyssey_target_gear=4, odyssey_shift_activity=68,
+                             odyssey_user_brake=.125 if braking else 0., odyssey_computer_braking=braking,
+                             odyssey_engine_torque_ts_nanos=now, odyssey_target_gear_ts_nanos=now,
+                             odyssey_computer_braking_ts_nanos=now)
+        output, sends = controller.update(control.as_reader(), structs.CarControlSP(), CS, now)
+        for addr, dat, bus in sends:
+          if addr == 0x1DF:
+            self.assertTrue(safety.safety_tx_hook(libsafety_py.make_CANPacket(addr, bus, dat)))
+        parser = CANParser(dbc, [('ACC_CONTROL', 0)], 1)
+        parser.update([(now, [msg for msg in sends if msg[0] == 0x1DF])])
+        signals = parser.vl['ACC_CONTROL']
+        self.assertEqual(signals['GAS_COMMAND'] >= 0, needs_gas and 5. <= speed <= 35.)
+        self.assertAlmostEqual(signals['ACCEL_COMMAND'], request, delta=.01)
+        self.assertAlmostEqual(output.accel, request, delta=.01)
+        if needs_gas and 5. <= speed <= 35.:
+          self.assertEqual(signals['BRAKE_REQUEST'], 0)
+        if request == -.6 or speed < 5.:
+          self.assertEqual(signals['BRAKE_REQUEST'], 1)
+
+  def test_prior_coast_avoids_gas_pulse_and_yields_to_demand_in_both_modes(self):
+    for econ, escape in product((False,), ('request', 'shortfall')):
+      with self.subTest(econ=econ, escape=escape):
+        CP = CarInterface.get_params(CAR.HONDA_ODYSSEY_5G_MMR, gen_empty_fingerprint(), [], True, False, False)
+        controller = CarController({Bus.pt: DBC[CP.carFingerprint][Bus.pt]}, CP, _sp(CP))
+        CS = CarState(CP, _sp(CP))
+        CS.update(CS.get_can_parsers(CP, _sp(CP)))
+        CS.out = structs.CarState(vEgo=20., aEgo=.09, canValid=True)
+        CS.odyssey_car_gas = CS.odyssey_user_brake = 0.
+        CS.odyssey_computer_braking = False
+        CS.odyssey_target_gear = 7
+        CS.odyssey_shift_activity = 119
+        controller.odyssey_eco_mode = econ
+        controller.frame = 102
+        controller.odyssey_pitch.x = -.04
+        controller.odyssey_coast_response.gear = 7
+        controller.odyssey_coast_response.coast_start = 0
+        controller.odyssey_coast_response.drag[7] = .25 + ACCELERATION_DUE_TO_GRAVITY * math.sin(-.04)
+        self.assertTrue(controller.odyssey_gas_coast_release.update(980_000_000, .1, .4, 20., -.04, 7, .25,
+                                                                    True, True, True, True))
+        control = structs.CarControl(enabled=True, longActive=True, orientationNED=[0., -.04, 0.])
+        control.actuators.accel = .1
+        control.actuators.longControlState = structs.CarControl.Actuators.LongControlState.pid
+        parser = CANParser(DBC[CP.carFingerprint][Bus.pt], [('ACC_CONTROL', 0)], 1)
+        for phase in (0, 1):
+          now = 1_000_000_000 + phase * 20_000_000
+          controller.frame = 102 + phase * 2
+          CS.odyssey_engine_torque_ts_nanos = CS.odyssey_target_gear_ts_nanos = CS.odyssey_computer_braking_ts_nanos = now - 5_000_000
+          if phase:
+            if escape == 'request':
+              control.actuators.accel = .6
+            elif escape == 'shortfall':
+              CS.out.aEgo = -.11
+            else:
+              pass  # Native ECON transitions are outside this port.
+          output, sends = controller.update(control.as_reader(), structs.CarControlSP(), CS, now)
+          parser.update([(now, [msg for msg in sends if msg[0] == 0x1DF])])
+          self.assertEqual(parser.vl['ACC_CONTROL']['BRAKE_REQUEST'], 0)
+          self.assertAlmostEqual(output.accel, control.actuators.accel, delta=.005)
+          if phase:
+            self.assertGreater(parser.vl['ACC_CONTROL']['GAS_COMMAND'], 0)
+          else:
+            self.assertEqual(parser.vl['ACC_CONTROL']['GAS_COMMAND'], -30000)
+
+  def test_prior_coast_forecast_tolerates_small_response_changes(self):
+    for request, excess in product((-.1, 0., .1), (.04, 0., -.01, -.19)):
+      with self.subTest(request=request, excess=excess):
+        response = OdysseyGasCoastRelease()
+        self.assertFalse(response.update(0, request, request + excess, 20., -.04, 7, request + .25, True, True))
+        self.assertTrue(response.update(20_000_000, request, request + .3, 20., -.04, 7, request + .25, True, True))
+        self.assertTrue(response.update(40_000_000, request, request + excess, 20., -.04, 7, request + .25, False, True))
+        self.assertEqual(odyssey_command_domains(request, 20., release_gas=response.active), (False, False))
+
+  def test_passive_coast_forecast_preserves_calibration_and_discards_ineligible_samples(self):
+    response = OdysseyCoastResponse()
+    for frame in range(0, 50, 2):
+      self.assertIsNone(response.update(frame, 7, 0.0, 9.0, True, True))
+    self.assertFalse(response.drag)
+    for frame, accel in zip(range(50, 60, 2), [0.25, 0.24, 3.0, 0.26, 0.27], strict=True):
+      self.assertIsNone(response.update(frame, 7, 0.0, accel, True, True))
+    self.assertAlmostEqual(response.update(60, 7, 0.0, 0.28, True, True), 0.26)
+    for frame in range(62, 80, 2):
+      self.assertAlmostEqual(response.update(frame, 7, 0.0, 0.26 if frame == 70 else 9.0, True, True), 0.27)
+    self.assertAlmostEqual(response.update(80, 7, 0.0, 0.25, True, True), 0.27)
+    self.assertAlmostEqual(response.update(82, 7, 0.0, -3.0, False, True), 0.26)
+    drag = response.drag.copy()
+    self.assertAlmostEqual(response.update(90, 7, 0.0, -3.0, False, True), 0.26)
+    self.assertEqual(response.drag, drag)
+    for frame in range(92, 140, 2):
+      self.assertIsNone(response.update(frame, 8, 0.0, 0.0, True, True))
+    # A known gear keeps its prior forecast while new coast observations settle.
+    for frame in range(140, 190, 2):
+      self.assertAlmostEqual(response.update(frame, 7, 0.0, 9.0, True, True), 0.26)
+    self.assertAlmostEqual(response.update(190, 7, 0.0, 9.0, True, True), 0.26)
+    self.assertTrue(response.samples)
+    self.assertIsNone(response.update(192, 7, 0.0, 0.0, False, False))
+    self.assertEqual(response.drag, drag)
+    self.assertFalse(response.samples)
+    self.assertIsNone(response.coast_start)
+    self.assertIsNone(response.gear)
+    self.assertAlmostEqual(response.update(194, 7, 0.0, -3.0, False, True), 0.26)
+    self.assertIsNone(response.update(196, 8, 0.0, -3.0, False, True))
+    for gear in (0, 13):
+      self.assertIsNone(response.update(198, gear, 0.0, -3.0, True, True))
+      self.assertEqual(response.drag, drag)
+      self.assertFalse(response.samples)
+      self.assertIsNone(response.coast_start)
+      self.assertIsNone(response.gear)
+      self.assertAlmostEqual(response.update(200, 7, 0.0, -3.0, False, True), 0.26)
+    for index in range(3):
+      for invalid in (math.nan, math.inf):
+        values = [7, 0.0, 0.0]
+        values[index] = invalid
+        response.drag = drag.copy()
+        self.assertIsNone(response.update(202, *values, True, True))
+        self.assertFalse(response.drag)
+    response.reset()
+    self.assertFalse(response.drag)
+
+  def test_coast_handoff_does_not_reintroduce_a_learned_gas_excess(self):
+    faults = (None, 'reverse_error', 'positive_offset', 'can', 'gas_pedal', 'brake_pedal', 'brake_feedback',
+              'pressure', 'invalid_pressure', 'invalid_response', 'gear', 'activity', 'pose', 'inactive',
+              'stopping', 'gear_age', 'brake_age', 'brake_command', 'large_offset', 'resume_gear', 'resume_activity',
+              'bridge_entry')
+    for econ, fault in product((False,), faults):
+      with self.subTest(econ=econ, fault=fault):
+        CP = CarInterface.get_params(CAR.HONDA_ODYSSEY_5G_MMR, gen_empty_fingerprint(), [], True, False, False)
+        dbc = DBC[CP.carFingerprint][Bus.pt]
+        controller = CarController({Bus.pt: dbc}, CP, _sp(CP))
+        CS = CarState(CP, _sp(CP))
+        CS.update(CS.get_can_parsers(CP, _sp(CP)))
+        CS.out = structs.CarState(vEgo=20., aEgo=-.1, canValid=True)
+        CS.odyssey_target_gear, CS.odyssey_shift_activity = 7, 119
+        control = structs.CarControl(enabled=True, longActive=True, orientationNED=[0., 0., 0.])
+        control.actuators.longControlState = structs.CarControl.Actuators.LongControlState.pid
+        parser = CANParser(dbc, [('ACC_CONTROL', 0)], 1)
+        controller.frame = 1
+        controller.update(control.as_reader(), structs.CarControlSP(), CS, 1_010_000_000)
+        response = controller.odyssey_gas_response
+        for _ in range(ODYSSEY_RESPONSE_DELAY_FRAMES + 50):
+          response.update(.1, -.1 if fault == 'positive_offset' else .3, 0., 20., 7, True,
+                          shift_activity=119, limits=(-300., 1700.))
+        offset = response.integral
+        if fault == 'large_offset':
+          response.integral = offset = -800.
+          response.correction = -850.
+        self.assertNotEqual(response.correction, offset)  # Coast must retain the offset, not the transient proportional term.
+        controller.odyssey_gas_selected = True
+        controller.gas = 200.
+        if fault == 'positive_offset':
+          CS.out.aEgo = 0.
+
+        def step(request, apply_fault=False, controller=controller, control=control, CS=CS, parser=parser,
+                 fault=fault, econ=econ):
+          control.actuators.accel = request
+          for _ in range(2):
+            now = 1_000_000_000 + controller.frame * 10_000_000
+            CS.odyssey_engine_torque_ts_nanos = CS.odyssey_target_gear_ts_nanos = CS.odyssey_computer_braking_ts_nanos = now - 5_000_000
+            if apply_fault:
+              if fault == 'can':
+                CS.out.canValid = False
+              elif fault in ('gas_pedal', 'brake_pedal'):
+                setattr(CS.out, 'gasPressed' if fault == 'gas_pedal' else 'brakePressed', True)
+              elif fault == 'brake_feedback':
+                CS.odyssey_computer_braking = True
+              elif fault == 'pressure':
+                CS.odyssey_user_brake = .03125
+              elif fault == 'invalid_pressure':
+                CS.odyssey_user_brake = math.nan
+              elif fault == 'invalid_response':
+                CS.out.aEgo = math.nan
+              elif fault == 'gear':
+                CS.odyssey_target_gear = 8
+              elif fault == 'activity':
+                CS.odyssey_shift_activity = 126
+              elif fault == 'pose':
+                control.orientationNED = []
+              elif fault == 'inactive':
+                control.longActive = False
+              elif fault == 'stopping':
+                control.actuators.longControlState = structs.CarControl.Actuators.LongControlState.stopping
+              elif fault in ('gear_age', 'brake_age'):
+                setattr(CS, 'odyssey_target_gear_ts_nanos' if fault == 'gear_age' else 'odyssey_computer_braking_ts_nanos', now - 60_000_000)
+            output, sends = controller.update(control.as_reader(), structs.CarControlSP(), CS, now)
+            packets = [p for p in sends if p[0] == 0x1DF and p[2] == 1]
+            if packets:
+              parser.update([(now, packets)])
+          return output
+
+        for _ in range(1 if fault == 'positive_offset' else 30):
+          step(-.25)
+          self.assertEqual(parser.vl['ACC_CONTROL']['GAS_COMMAND'], -30000)
+          self.assertEqual(parser.vl['ACC_CONTROL']['BRAKE_REQUEST'], 0)
+          self.assertFalse(response.requests)
+          self.assertFalse(response.error.initialized)
+          self.assertEqual(response.integral, 0. if fault == 'positive_offset' else offset)
+        if fault not in (None, 'reverse_error', 'large_offset', 'resume_gear', 'resume_activity', 'bridge_entry'):
+          step(-.5 if fault == 'brake_command' else -.25, apply_fault=True)
+          self.assertEqual(response.integral, 0.)
+          self.assertEqual(response.correction, 0.)
+        else:
+          if fault == 'bridge_entry':
+            step(-.05)
+            self.assertEqual(parser.vl['ACC_CONTROL']['GAS_COMMAND'], ODYSSEY_GAS_BRIDGE_COMMAND)
+            self.assertEqual(response.integral, 0.)
+            self.assertEqual(response.correction, 0.)
+            self.assertFalse(response.requests)
+            continue
+          CS.out.aEgo = -.1 if fault == 'reverse_error' else .1
+          if fault == 'large_offset':
+            CS.out.aEgo = -.1
+          elif fault == 'resume_gear':
+            CS.odyssey_target_gear = 8
+          elif fault == 'resume_activity':
+            CS.odyssey_shift_activity = 126
+          request = .5 if fault == 'reverse_error' else .1
+          output = step(request)
+          base, _ = odyssey_gas_feedforward(request, request, 20., controller.params)
+          self.assertEqual(len(response.requests), 0 if fault == 'resume_mode' else 1)
+          self.assertEqual(parser.vl['ACC_CONTROL']['BRAKE_REQUEST'], 0)
+          self.assertAlmostEqual(output.accel, request)
+          self.assertAlmostEqual(output.gas, base + response.correction, delta=.0001)
+          if fault in ('resume_gear', 'resume_activity', 'resume_mode'):
+            self.assertEqual(response.correction, 0.)
+            self.assertEqual(response.integral, 0.)
+          elif fault is None:
+            self.assertEqual(response.correction, offset)
+            self.assertLess(parser.vl['ACC_CONTROL']['GAS_COMMAND'], base)
+          else:
+            self.assertGreater(response.correction, offset)
+            self.assertLessEqual(response.correction, 0.)
+          if fault == 'large_offset':
+            self.assertGreaterEqual(response.correction, -base)
+            self.assertGreater(parser.vl['ACC_CONTROL']['GAS_COMMAND'], 0.)
+            for _ in range(math.ceil(base / ODYSSEY_RESPONSE_SLEW_COUNTS)):
+              output = step(request)
+            self.assertGreaterEqual(output.gas, base)
+
+  def test_capped_gas_response_does_not_reintroduce_error_after_observer_restart(self):
+    # An illustrative plant checks state continuity, not the Honda gas-map gain.
+    for change in ('gear', 'activity', 'clear'):
+      with self.subTest(change=change):
+        response = OdysseyGasResponse()
+        achieved = .14
+        delay = deque([achieved] * ODYSSEY_RESPONSE_DELAY_FRAMES)
+        before, after = [], []
+        for frame in range(2200):
+          changed = frame >= 2000
+          if frame == 2000 and change == 'clear':
+            response.clear_observer()
+          correction = response.update(.2, achieved, .04, 20., 7 if changed and change == 'gear' else 6, True,
+                                       cap_weight=1., shift_activity=110 if changed and change == 'activity' else 102,
+                                       limits=(-600., 600.))
+          delay.append(.14 + .003 * correction)
+          achieved += (delay.popleft() - achieved) * .02 / (.15 + .02)
+          if 1900 <= frame < 2000:
+            before.append(abs(.2 - achieved))
+          elif changed:
+            after.append(abs(.2 - achieved))
+        self.assertLess(max(before), .003)
+        self.assertLess(max(after), .003)
+
+  def test_small_excess_does_not_erase_issued_gas_after_observer_restart(self):
+    for change, excess in product(('gear', 'activity', 'clear'), (1e-6, .001, .02)):
+      with self.subTest(change=change, excess=excess):
+        response = OdysseyGasResponse()
+        for _ in range(100):
+          response.update(.2, .17, .04, 20., 6, True, cap_weight=1.,
+                          shift_activity=102, limits=(-600., 600.))
+        issued = response.correction
+        self.assertGreater(issued, 10.)
+        if change == 'clear':
+          response.clear_observer()
+        correction = response.update(.2, .2 + excess, .04, 20., 7 if change == 'gear' else 6, True,
+                                     cap_weight=1., shift_activity=110 if change == 'activity' else 102,
+                                     limits=(-600., 600.))
+        self.assertLess(correction, issued)
+        self.assertLessEqual(issued - correction, ODYSSEY_RESPONSE_COUNTS_PER_ACCEL * excess + 1e-8)
+
+  def test_uphill_load_is_consistent_across_zero_and_positive_requests(self):
+    for pitch, request in product((.04, .07, .09), (-.2, -.1, 0., .05, .2, .3, 1.)):
+      with self.subTest(pitch=pitch, request=request):
+        load = ACCELERATION_DUE_TO_GRAVITY * math.sin(pitch) * ODYSSEY_GRADE_GAIN
+        self.assertAlmostEqual(odyssey_grade_gas_accel(request, pitch) - request, load)
+
+  def test_gas_response_keeps_calibration_through_small_measurement_noise(self):
+    request, noise = .4, .05
+    for direction in (-1., 1.):
+      with self.subTest(direction=direction):
+        response = OdysseyGasResponse()
+        for _ in range(300):
+          response.update(request, request - direction * .2, 0., 25., 7, True, limits=(-500., 1500.))
+        for _ in range(100):
+          response.update(request, request, 0., 25., 7, True, limits=(-500., 1500.))
+        offset = response.correction
+        self.assertGreater(direction * offset, 100.)
+        observed = []
+        for frame in range(500):
+          aego = request + noise * math.sin(2 * math.pi * frame / 50.)
+          observed.append(response.update(request, aego, 0., 25., 7, True, limits=(-500., 1500.)))
+        self.assertAlmostEqual(sum(observed[-200:]) / 200., offset, delta=ODYSSEY_RESPONSE_COUNTS_PER_ACCEL * noise)
+
+  def test_added_gas_withdraws_when_settled_response_exceeds_request(self):
+    CP = CarInterface.get_params(CAR.HONDA_ODYSSEY_5G_MMR, gen_empty_fingerprint(), [], True, False, False)
+    dbc = DBC[CP.carFingerprint][Bus.pt]
+    for econ, gear_change in product((False,), (False, True)):
+      with self.subTest(econ=econ, gear_change=gear_change):
+        controller = CarController({Bus.pt: dbc}, CP, _sp(CP))
+        CS = CarState(CP, _sp(CP))
+        CS.update(CS.get_can_parsers(CP, _sp(CP)))
+        CS.out = structs.CarState(vEgo=25., aEgo=0., canValid=True)
+        CS.odyssey_target_gear, CS.odyssey_shift_activity = 7, 119
+        CS.odyssey_car_gas, CS.odyssey_user_brake = 1., 0.
+        CS.odyssey_computer_braking = False
+        control = structs.CarControl(enabled=True, longActive=True, orientationNED=[0., .05, 0.])
+        control.actuators.accel = .8
+        control.actuators.longControlState = structs.CarControl.Actuators.LongControlState.pid
+        parser = CANParser(dbc, [('ACC_CONTROL', 0)], 1)
+
+        def step(controller=controller, CS=CS, control=control, parser=parser):
+          now = 1_000_000_000 + controller.frame * 10_000_000
+          CS.odyssey_engine_torque_ts_nanos = CS.odyssey_target_gear_ts_nanos = CS.odyssey_computer_braking_ts_nanos = now
+          _, sends = controller.update(control.as_reader(), structs.CarControlSP(), CS, now)
+          parser.update([(now, sends)])
+
+        for _ in range(300):
+          step()
+        self.assertGreater(controller.odyssey_gas_response.correction, 300.)
+        control.actuators.accel, CS.out.aEgo = .2, .6
+        if gear_change:
+          CS.odyssey_target_gear, CS.odyssey_shift_activity = 6, 102
+        previous = controller.odyssey_gas_response.correction
+        for _ in range(200):
+          step()
+          correction = controller.odyssey_gas_response.correction
+          self.assertLessEqual(abs(correction - previous), ODYSSEY_RESPONSE_SLEW_COUNTS + 1e-9)
+          previous = correction
+          self.assertAlmostEqual(parser.vl['ACC_CONTROL']['ACCEL_COMMAND'], .2, delta=.01)
+          self.assertEqual(parser.vl['ACC_CONTROL']['BRAKE_REQUEST'], 0)
+        self.assertLessEqual(controller.odyssey_gas_response.correction, 0.)
+
   def test_gas_entry_waits_for_received_brake_release(self):
     CP = CarInterface.get_params(CAR.HONDA_ODYSSEY_5G_MMR, gen_empty_fingerprint(), [], True, False, False)
     dbc = DBC[CP.carFingerprint][Bus.pt]
-    for dwell in (2, 40):
+    for speed, dwell in product((5., 7.5, 20.), (2, 40)):
       for feedback in ('computer_braking', 'computer_braking_nan', 'user_brake'):
-        with self.subTest(dwell=dwell, feedback=feedback):
+        with self.subTest(speed=speed, dwell=dwell, feedback=feedback):
           controller = CarController({Bus.pt: dbc}, CP, _sp(CP))
           controller.odyssey_brake_selected = True
           CS = CarState(CP, _sp(CP))
           CS.update(CS.get_can_parsers(CP, _sp(CP)))
-          CS.out = structs.CarState(vEgo=20., aEgo=-.3, canValid=True)
+          CS.out = structs.CarState(vEgo=speed, aEgo=-.3, canValid=True)
           CS.odyssey_target_gear = 7
           CS.odyssey_car_gas = 0.
           CS.odyssey_computer_braking = feedback.startswith('computer_braking')
@@ -221,7 +655,7 @@ class TestOdysseyLongitudinal(unittest.TestCase):
         controller.odyssey_gas_selected = fault == 'already_gas'
         CS = CarState(CP, _sp(CP))
         CS.update(CS.get_can_parsers(CP, _sp(CP)))
-        speed = 7.9 if fault == 'low_speed' else 35.1 if fault == 'high_speed' else 20.
+        speed = 4.9 if fault == 'low_speed' else 35.1 if fault == 'high_speed' else 20.
         CS.out = structs.CarState(vEgo=speed, aEgo=-.3, canValid=fault != 'invalid_can')
         now = 1_000_000_000
         CS.odyssey_target_gear = 7
@@ -299,9 +733,9 @@ class TestOdysseyLongitudinal(unittest.TestCase):
           self.assertAlmostEqual(invalid['ACCEL_COMMAND'], request, delta=0.01)
           self.assertEqual(invalid['BRAKE_REQUEST'], request < 0.0)
           if request > 0.0:
-            raw_gas = float((request - ODYSSEY_GAS_MAP_FLOOR) /
-                            (CarControllerParams.BOSCH_GAS_LOOKUP_BP[-1] - ODYSSEY_GAS_MAP_FLOOR) *
-                            CarControllerParams.BOSCH_GAS_LOOKUP_V[-1])
+            raw_gas = float((request - controller.params.BOSCH_GAS_LOOKUP_BP[0]) /
+                            (controller.params.BOSCH_GAS_LOOKUP_BP[-1] - controller.params.BOSCH_GAS_LOOKUP_BP[0]) *
+                            controller.params.BOSCH_GAS_LOOKUP_V[-1])
             self.assertAlmostEqual(invalid['GAS_COMMAND'], odyssey_low_speed_gas_command(raw_gas, request, state.vEgo), delta=1)
           restored = step(0.04)
           self.assertTrue(math.isfinite(controller.odyssey_pitch.x))
@@ -386,7 +820,7 @@ class TestOdysseyLongitudinal(unittest.TestCase):
     pitch = 0.03
     grade = math.sin(pitch) * ACCELERATION_DUE_TO_GRAVITY
     load = min(grade / ODYSSEY_GRADE_RAMP_ACCEL, 1.0)
-    zero_grade = grade * ODYSSEY_ZERO_GAS_GRADE_GAIN * load * load
+    zero_grade = grade * ODYSSEY_GRADE_GAIN * load * load
     self.assertAlmostEqual(odyssey_grade_gas_accel(0.0, pitch), zero_grade)
     self.assertGreater(odyssey_grade_gas_accel(-0.10, pitch), -0.10)
     self.assertAlmostEqual(odyssey_grade_gas_accel(-0.20, pitch), -0.20 + zero_grade)
@@ -462,7 +896,6 @@ class TestOdysseyLongitudinal(unittest.TestCase):
       self.assertLessEqual(gas[2], gas[1])
 
   def test_negative_request_uphill_gas_scales_with_grade_without_reversing_request_order(self):
-    self.assertEqual(ODYSSEY_ZERO_GAS_GRADE_GAIN, 0.25)
     mild = odyssey_grade_gas_accel(-0.20, 0.02)
     steep = odyssey_grade_gas_accel(-0.20, 0.07)
     self.assertLess(mild, -0.10)
@@ -755,27 +1188,25 @@ class TestOdysseyLongitudinal(unittest.TestCase):
 
   def test_gas_response_converges_after_request_change_with_available_headroom(self):
     # Illustrative delayed plant: a convergence regression, not an identified Honda gas gain.
-    for gain in (.001, .003):
-      for bias in (-.3, -.06, .06, .3):
-        for cap in (0., 1.):
-          with self.subTest(gain=gain, bias=bias, cap=cap):
-            response = OdysseyGasResponse()
-            delay = deque([.2 + bias] * 36)
-            achieved = .2 + bias
-            previous_command = .2
-            errors = []
-            for frame in range(2000):
-              request = .2 if frame < 1000 else .1
-              correction = response.update(request, achieved, 0., 20., 6, True, cap_weight=cap, limits=(-600., 600.))
-              command = request + gain * correction
-              if frame == 1000:
-                self.assertLess(command, previous_command)
-              previous_command = command
-              delay.append(command + bias)
-              achieved += (delay.popleft() - achieved) * DT_CTRL * 2 / (.15 + DT_CTRL * 2)
-              if frame >= 1900:
-                errors.append(abs(request - achieved))
-            self.assertLess(sum(errors) / len(errors), .003)
+    for initial_request, gain, bias, cap in product((.2, .8), (.001, .003), (-.3, -.06, .06, .3), (0., 1.)):
+      with self.subTest(initial_request=initial_request, gain=gain, bias=bias, cap=cap):
+        response = OdysseyGasResponse()
+        delay = deque([initial_request + bias] * 36)
+        achieved = initial_request + bias
+        previous_command = initial_request
+        errors = []
+        for frame in range(2000):
+          request = initial_request if frame < 1000 else .1
+          correction = response.update(request, achieved, 0., 20., 6, True, cap_weight=cap, limits=(-600., 600.))
+          command = request + gain * correction
+          if frame == 1000:
+            self.assertLess(command, previous_command)
+          previous_command = command
+          delay.append(command + bias)
+          achieved += (delay.popleft() - achieved) * DT_CTRL * 2 / (.15 + DT_CTRL * 2)
+          if frame >= 1900:
+            errors.append(abs(request - achieved))
+        self.assertLess(sum(errors) / len(errors), .003)
 
   def test_gas_response_retained_reduction_follows_available_headroom(self):
     response = OdysseyGasResponse()
@@ -904,7 +1335,8 @@ class TestOdysseyLongitudinal(unittest.TestCase):
         response = OdysseyGasResponse()
         response.correction = 20.
         response.update(.2, .7, 0., 20., 6, True, limits=(lower, 600.))
-        self.assertEqual(response.integral, 0.)
+        self.assertGreaterEqual(response.integral, lower)
+        self.assertLessEqual(response.integral, 20.)
         self.assertLessEqual(abs(response.correction - 20.), ODYSSEY_RESPONSE_SLEW_COUNTS)
 
   def test_gas_feedback_preserves_headroom_after_a_request_change(self):
@@ -1320,32 +1752,6 @@ class TestOdysseyLongitudinal(unittest.TestCase):
           parser.update([(now, [msg for msg in sends if msg[0] == 0x1DF])])
         self.assertGreater(parser.vl['ACC_CONTROL']['GAS_COMMAND'], 0)
 
-  def test_passive_coast_forecast_is_prior_only_and_resets_on_ineligible_state(self):
-    response = OdysseyCoastResponse()
-    for frame in range(0, 50, 2):
-      self.assertIsNone(response.update(frame, 7, 0.0, 9.0, True, True))
-    self.assertFalse(response.warmup)
-    for frame, accel in zip(range(50, 60, 2), [0.25, 0.24, 3.0, 0.26, 0.27], strict=True):
-      self.assertIsNone(response.update(frame, 7, 0.0, accel, True, True))
-    self.assertAlmostEqual(response.update(60, 7, 0.0, 0.28, True, True), 0.26)
-    self.assertEqual(len(response.warmup[7]), 5)
-    for frame in range(62, 80, 2):
-      self.assertAlmostEqual(response.update(frame, 7, 0.0, 0.26 if frame == 70 else 9.0, True, True), 0.27)
-    self.assertAlmostEqual(response.update(80, 7, 0.0, 0.25, True, True), 0.27)
-    self.assertAlmostEqual(response.update(82, 7, 0.0, -3.0, False, True), 0.26)
-    samples = list(response.warmup[7])
-    self.assertAlmostEqual(response.update(90, 7, 0.0, -3.0, False, True), 0.26)
-    self.assertEqual(list(response.warmup[7]), samples)
-    for frame in range(92, 140, 2):
-      self.assertIsNone(response.update(frame, 8, 0.0, 0.0, True, True))
-    # A known gear keeps its prior forecast while new coast observations settle.
-    for frame in range(140, 190, 2):
-      self.assertAlmostEqual(response.update(frame, 7, 0.0, 9.0, True, True), 0.26)
-    self.assertNotIn(7, response.warmup)
-    self.assertIsNone(response.update(190, 7, 0.0, 0.0, False, False))
-    self.assertFalse(response.drag)
-    self.assertFalse(response.warmup)
-
   def test_nonnegative_brake_hold_does_not_learn_its_response_as_coast(self):
     CP = CarInterface.get_params(CAR.HONDA_ODYSSEY_5G_MMR, gen_empty_fingerprint(), [], True, False, False)
     dbc = DBC[CP.carFingerprint][Bus.pt]
@@ -1411,7 +1817,7 @@ class TestOdysseyLongitudinal(unittest.TestCase):
         if fault == 'pose':
           control.orientationNED = []
         elif fault in ('low_speed', 'high_speed'):
-          state.vEgo = 7.9 if fault == 'low_speed' else 35.1
+          state.vEgo = 4.9 if fault == 'low_speed' else 35.1
         elif fault == 'no_history':
           controller.odyssey_coast_response.drag.clear()
         elif fault == 'unknown_gear':
@@ -1547,7 +1953,7 @@ from opendbc.car.honda.carcontroller import OdysseyCoastResponse
 response = OdysseyCoastResponse()
 for frame in range(0, 58, 2):
   response.update(frame, 7, 0.0, -0.2, True, True)
-assert len(response.warmup[7]) == 4
+assert not response.drag
 loaded = set(sys.modules)
 assert response.update(58, 7, 0.0, -0.2, True, True) is None
 assert not set(sys.modules) - loaded, sorted(set(sys.modules) - loaded)
@@ -1573,7 +1979,7 @@ assert response.update(60, 7, 0.0, -0.2, True, True) == -0.2
         response = OdysseyCoastResponse()
         for frame in range(0, 56, 2):
           self.assertIsNone(response.update(frame, 7, 0., -.4, True, True))
-        self.assertEqual(len(response.warmup[7]), 3)
+        self.assertNotIn(7, response.drag)
         response.update(56, 8 if interruption == 'gear' else 7, 0., -.4,
                         interruption != 'controlled', interruption != 'invalid')
         for frame in range(3600, 3660, 2):
@@ -1601,7 +2007,8 @@ assert response.update(60, 7, 0.0, -0.2, True, True) == -0.2
     self.assertEqual(odyssey_command_domains(-0.40, 25.0, previous_gas=True, release_gas=True), (False, True))
     self.assertEqual(odyssey_command_domains(-0.15, 4.0, previous_gas=True, release_gas=True), (False, True))
     self.assertTrue(response.update(42 * 10_000_000, -0.15, 0.30, 25.0, -0.03, 9, 0.09, False, True))
-    self.assertFalse(response.update(44 * 10_000_000, -0.15, -0.11, 25.0, -0.03, 9, 0.09, False, True))
+    self.assertTrue(response.update(44 * 10_000_000, -0.15, -0.11, 25.0, -0.03, 9, 0.09, False, True))
+    self.assertFalse(response.update(45 * 10_000_000, -0.15, -0.36, 25.0, -0.03, 9, 0.09, False, True))
     self.assertFalse(response.update(46 * 10_000_000, 0.10, 0.30, 25.0, -0.03, 9, 0.09, True, True))
     self.assertFalse(response.update(48 * 10_000_000, -0.15, 0.30, 25.0, -0.03, 9, 0.09, True, False))
     self.assertFalse(response.requests)
@@ -1616,7 +2023,7 @@ assert response.update(60, 7, 0.0, -0.2, True, True) == -0.2
     self.assertFalse(response.update(24 * 10_000_000, -0.15, 0.30, 25.0, -0.03, 9, 0.09, True, False))
 
   def test_downhill_coast_follows_positive_demand_and_measured_response(self):
-    for request, aego, passive in ((0.35, 0.60, 0.30), (0.05, 0.06, 0.30), (0.05, 0.60, 0.0)):
+    for request, aego, passive in ((0.35, 0.60, 0.30), (0.05, -0.16, 0.30), (0.05, 0.60, 0.0)):
       response = OdysseyGasCoastRelease()
       self.assertTrue(response.update(0, 0.05, 0.60, 20.0, -0.04, 7, 0.30, True, True))
       self.assertEqual(odyssey_command_domains(0.05, 20.0, previous_gas=True, release_gas=True), (False, False))
@@ -1853,7 +2260,7 @@ assert response.update(60, 7, 0.0, -0.2, True, True) == -0.2
             elif fault == 'stopping':
               control.actuators.longControlState = structs.CarControl.Actuators.LongControlState.stopping
             elif fault in ('low_speed', 'high_speed'):
-              CS.out.vEgo = 7.99 if fault == 'low_speed' else 35.01
+              CS.out.vEgo = 4.99 if fault == 'low_speed' else 35.01
             elif fault == 'gear':
               CS.odyssey_target_gear = 8
             elif fault == 'activity':
@@ -1883,17 +2290,18 @@ assert response.update(60, 7, 0.0, -0.2, True, True) == -0.2
           self.assertTrue(release.update(frame * 20_000_000, request, request + excess, 20., 0., 7, forecast, False, True,
                                          downhill=False))
         now = 600_000_000
-        for next_request, achieved, speed, gear, eligible in (
+        for index, (next_request, achieved, speed, gear, eligible) in enumerate((
           (request, request + .04, 20., 7, True),
+          (request, request - .21, 20., 7, True),
           (-.4, request + .3, 20., 7, True),
-          (request, request + .3, 7.99, 7, True),
+          (request, request + .3, 4.99, 7, True),
           (request, request + .3, 35.01, 7, True),
           (request, request + .3, 20., 8, True),
           (request, request + .3, 20., 7, False),
-        ):
+        )):
           self.assertTrue(release.update(now, request, request + .3, 20., 0., 7, forecast, True, True, True, True, False))
-          self.assertFalse(release.update(now + 20_000_000, next_request, achieved, speed, 0., gear, forecast, False, eligible,
-                                          downhill=False))
+          self.assertEqual(release.update(now + 20_000_000, next_request, achieved, speed, 0., gear, forecast, False, eligible,
+                                         downhill=False), index == 0 and forecast_offset == .5)
           now += 40_000_000
 
   def test_downhill_coast_waits_for_the_issued_zero_gas_command(self):
@@ -1936,7 +2344,8 @@ assert response.update(60, 7, 0.0, -0.2, True, True) == -0.2
 
     CP = CarInterface.get_params(CAR.HONDA_ODYSSEY_5G_MMR, gen_empty_fingerprint(), [], True, False, False)
     dbc = DBC[CP.carFingerprint][Bus.pt]
-    for blocked in (None, 'gas_pedal', 'brake_pedal', 'received_gas', 'computer_brake', 'pressure', 'missing_pressure',
+    for blocked in (None, 'interrupted_gas', 'interrupted_brake', 'idle_stop', 'gas_pedal', 'brake_pedal',
+                    'received_gas', 'computer_brake', 'pressure', 'missing_pressure',
                     'stale_gas', 'stale_gear', 'stale_brake', 'invalid_can', 'invalid_pose', 'invalid_gear',
                     'low_speed', 'high_speed', 'unsettled', 'active_non_pid'):
       with self.subTest(blocked=blocked):
@@ -1971,7 +2380,21 @@ assert response.update(60, 7, 0.0, -0.2, True, True) == -0.2
             self.assertEqual(signals['BRAKE_REQUEST'], 0)
             self.assertEqual(signals['GAS_COMMAND'], -30000)
             self.assertEqual(signals['ACCEL_COMMAND'], 0)
-        self.assertEqual(bool(controller.odyssey_coast_response.drag), blocked is None)
+        learned = blocked in (None, 'interrupted_gas', 'interrupted_brake', 'idle_stop')
+        self.assertEqual(bool(controller.odyssey_coast_response.drag), learned)
+        if blocked in ('interrupted_gas', 'interrupted_brake', 'idle_stop'):
+          prior = controller.odyssey_coast_response.drag.copy()
+          CS.out.gasPressed = blocked == 'interrupted_gas'
+          CS.out.brakePressed = blocked in ('interrupted_brake', 'idle_stop')
+          if blocked == 'idle_stop':
+            CS.out.vEgo = CS.out.aEgo = 0.
+            CS.odyssey_target_gear = 0
+            CS.odyssey_user_brake = .5
+          step()
+          step()
+          self.assertEqual(controller.odyssey_coast_response.drag, prior)
+          self.assertFalse(controller.odyssey_coast_response.samples)
+          self.assertIsNone(controller.odyssey_coast_response.coast_start)
         control.longActive = True
         control.orientationNED = [0., -.02, 0.]
         control.actuators.longControlState = structs.CarControl.Actuators.LongControlState.pid
@@ -1984,10 +2407,10 @@ assert response.update(60, 7, 0.0, -0.2, True, True) == -0.2
         output, messages = step()
         self.assertEqual(len(messages), 1)
         signals = parser.vl['ACC_CONTROL']
-        self.assertEqual(signals['BRAKE_REQUEST'], blocked is None)
+        self.assertEqual(signals['BRAKE_REQUEST'], learned)
         self.assertAlmostEqual(signals['ACCEL_COMMAND'], -.1, delta=.01)
         self.assertAlmostEqual(output.accel, -.1, delta=.01)
-        if blocked is None:
+        if learned:
           self.assertEqual(signals['GAS_COMMAND'], -30000)
           safety = libsafety_py.libsafety
           config = CP.safetyConfigs[-1]
@@ -2189,7 +2612,6 @@ assert response.update(60, 7, 0.0, -0.2, True, True) == -0.2
           values = parser.vl['ACC_CONTROL']
           self.assertAlmostEqual(values['ACCEL_COMMAND'], control.actuators.accel if control.longActive else 0., delta=.01)
           self.assertEqual(controller.odyssey_coast_response.drag[7], drag)
-          self.assertFalse(controller.odyssey_coast_response.warmup)
           if released and change is None:
             self.assertGreaterEqual(values['GAS_COMMAND'], 0)
             self.assertEqual(values['BRAKE_REQUEST'], 0)
@@ -2497,7 +2919,7 @@ assert response.update(60, 7, 0.0, -0.2, True, True) == -0.2
         elif blocked == 'not_pid':
           control.actuators.longControlState = structs.CarControl.Actuators.LongControlState.stopping
         elif blocked == 'low_speed':
-          state.vEgo = 7.9
+          state.vEgo = 4.9
         elif blocked == 'high_speed':
           state.vEgo = 35.1
         elif blocked == 'received_brake':
@@ -2521,7 +2943,8 @@ assert response.update(60, 7, 0.0, -0.2, True, True) == -0.2
               self.assertGreater(values['GAS_COMMAND'], 0)
           else:
             self.assertEqual(values['GAS_COMMAND'], -30000)
-            self.assertEqual(values['BRAKE_REQUEST'], control.longActive and control.actuators.accel < ODYSSEY_ROAD_BRAKE_ENTRY)
+            self.assertEqual(values['BRAKE_REQUEST'], control.longActive and
+                             (control.actuators.accel < ODYSSEY_ROAD_BRAKE_ENTRY or blocked == 'low_speed'))
 
   def test_mild_request_does_not_drop_needed_gas(self):
     from opendbc.safety.tests.libsafety import libsafety_py
@@ -2530,7 +2953,8 @@ assert response.update(60, 7, 0.0, -0.2, True, True) == -0.2
     dbc = DBC[CP.carFingerprint][Bus.pt]
     for change, eco_mode in product((None, 'at_target', 'more_decel', 'excess', 'stronger', 'gear', 'activity', 'stale_engine', 'stale_gear',
                                     'stale_VSA', 'invalid_CAN', 'pose', 'gas_pedal', 'brake_pedal', 'inactive', 'not_pid',
-                                    'low_speed', 'high_speed', 'no_offset', 'new_domain', 'bridge', 'received_brake', 'pressure', 'forecast'),
+                                    'low_speed', 'high_speed', 'no_offset', 'no_offset_at_floor', 'new_domain', 'bridge', 'received_brake',
+                                    'pressure', 'forecast'),
                                    (False, True)):
       with self.subTest(change=change, eco_mode=eco_mode):
         controller = CarController({Bus.pt: dbc}, CP, _sp(CP))
@@ -2589,11 +3013,13 @@ assert response.update(60, 7, 0.0, -0.2, True, True) == -0.2
             elif change == 'not_pid':
               control.actuators.longControlState = structs.CarControl.Actuators.LongControlState.stopping
             elif change == 'low_speed':
-              state.vEgo = 7.9
+              state.vEgo = 4.9
             elif change == 'high_speed':
               state.vEgo = 35.1
-            elif change == 'no_offset':
+            elif change in ('no_offset', 'no_offset_at_floor'):
               controller.odyssey_gas_response.correction = 0.
+              if change == 'no_offset_at_floor':
+                control.orientationNED = [0., 0., 0.]
             elif change == 'new_domain':
               controller.odyssey_gas_selected = False
             elif change == 'bridge':
@@ -2615,8 +3041,8 @@ assert response.update(60, 7, 0.0, -0.2, True, True) == -0.2
           if frame >= 140:
             self.assertAlmostEqual(values['ACCEL_COMMAND'], control.actuators.accel if control.longActive else 0., delta=.01)
             self.assertAlmostEqual(output.accel, values['ACCEL_COMMAND'], delta=.01)
-            self.assertEqual(values['BRAKE_REQUEST'], change == 'stronger')
-            if change in (None, 'at_target', 'more_decel', 'gear', 'activity'):
+            self.assertEqual(values['BRAKE_REQUEST'], change in ('stronger', 'low_speed'))
+            if change in (None, 'at_target', 'more_decel', 'gear', 'activity', 'no_offset'):
               self.assertGreater(values['GAS_COMMAND'], 0)
               if change in ('gear', 'activity'):
                 # Restart delayed history while retaining gas still needed by the live response.
@@ -2938,15 +3364,15 @@ assert response.update(60, 7, 0.0, -0.2, True, True) == -0.2
       self.assertAlmostEqual(values['ACCEL_COMMAND'], request, delta=.01)
       self.assertAlmostEqual(output.accel, request, delta=.00001)
       self.assertEqual(controller.odyssey_coast_response.drag[7], drag)
-      self.assertFalse(controller.odyssey_coast_response.warmup)
 
   def test_brake_release_does_not_reverse_on_a_small_forecast_shortfall_while_overbraking(self):
     CP = CarInterface.get_params(CAR.HONDA_ODYSSEY_5G_MMR, gen_empty_fingerprint(), [], True, False, False)
     dbc = DBC[CP.carFingerprint][Bus.pt]
-    for econ in (False, True):
+    for econ in (False,):
       with self.subTest(econ=econ):
         controller = CarController({Bus.pt: dbc}, CP, _sp(CP))
         controller.frame = 100
+        controller.odyssey_eco_mode = econ
         controller.odyssey_brake_selected = True
         controller.odyssey_brake_start_frame = 0
         controller.odyssey_pitch.x = .02
@@ -2981,16 +3407,16 @@ assert response.update(60, 7, 0.0, -0.2, True, True) == -0.2
           self.assertAlmostEqual(values['ACCEL_COMMAND'], request, delta=.01)
           self.assertAlmostEqual(output.accel, request, delta=.00001)
           self.assertEqual(controller.odyssey_coast_response.drag[6], drag)
-          self.assertFalse(controller.odyssey_coast_response.warmup)
 
   def test_settled_excess_braking_can_release_to_a_close_coast_forecast(self):
     CP = CarInterface.get_params(CAR.HONDA_ODYSSEY_5G_MMR, gen_empty_fingerprint(), [], True, False, False)
     dbc = DBC[CP.carFingerprint][Bus.pt]
-    for econ in (False, True):
+    for econ in (False,):
       with self.subTest(econ=econ):
         controller = CarController({Bus.pt: dbc}, CP, _sp(CP))
         controller.frame = 100
         controller.accel = -.2
+        controller.odyssey_eco_mode = econ
         controller.odyssey_brake_selected = True
         controller.odyssey_brake_start_frame = 0
         controller.odyssey_coast_response.gear = 6
@@ -3021,7 +3447,6 @@ assert response.update(60, 7, 0.0, -0.2, True, True) == -0.2
           self.assertAlmostEqual(output.accel, -.2, delta=1e-5)
         self.assertTrue(released)
         self.assertEqual(controller.odyssey_coast_response.drag[6], -.15)
-        self.assertFalse(controller.odyssey_coast_response.warmup)
         control.actuators.accel = -.35
         for _ in range(2):
           now = 2_000_000_000 + controller.frame * 10_000_000
@@ -3034,12 +3459,13 @@ assert response.update(60, 7, 0.0, -0.2, True, True) == -0.2
   def test_initial_coast_margin_requires_settled_consistent_excess(self):
     CP = CarInterface.get_params(CAR.HONDA_ODYSSEY_5G_MMR, gen_empty_fingerprint(), [], True, False, False)
     dbc = DBC[CP.carFingerprint][Bus.pt]
-    for econ, blocked in product((False, True), (None, 'cold', 'unsettled', 'gear_change', 'stronger',
+    for econ, blocked in product((False,), (None, 'cold', 'unsettled', 'gear_change', 'stronger',
                                                'response', 'forecast', 'invalid_can', 'low_speed', 'high_speed')):
       with self.subTest(econ=econ, blocked=blocked):
         controller = CarController({Bus.pt: dbc}, CP, _sp(CP))
         controller.frame = 100
         controller.accel = -.1 if blocked == 'stronger' else -.2
+        controller.odyssey_eco_mode = not econ if blocked == 'mode_switch' else econ
         controller.odyssey_brake_selected = True
         controller.odyssey_brake_start_frame = 80 if blocked == 'unsettled' else 0
         controller.odyssey_brake_response_error.x = 0. if blocked == 'cold' else .3
@@ -3050,7 +3476,7 @@ assert response.update(60, 7, 0.0, -0.2, True, True) == -0.2
         if blocked != 'stronger':
           controller.accel = control.actuators.accel
         control.actuators.longControlState = structs.CarControl.Actuators.LongControlState.pid
-        state = structs.CarState(vEgo=7.9 if blocked == 'low_speed' else 35.1 if blocked == 'high_speed' else 20.,
+        state = structs.CarState(vEgo=4.9 if blocked == 'low_speed' else 35.1 if blocked == 'high_speed' else 20.,
                                  aEgo=-.35 if blocked == 'response' else -.55, canValid=blocked != 'invalid_can')
         now = 2_000_000_000
         CS = SimpleNamespace(out=state, v_cruise_factor=.44704, is_metric=False, acc_hud={}, lkas_hud={}, stock_brake={},
@@ -3122,7 +3548,7 @@ assert response.update(60, 7, 0.0, -0.2, True, True) == -0.2
         control = structs.CarControl(enabled=True, longActive=True, orientationNED=[0., 0., 0.])
         control.actuators.accel = -.2
         control.actuators.longControlState = structs.CarControl.Actuators.LongControlState.pid
-        state = structs.CarState(vEgo=7.5 if blocked == 'low_speed' else 20.,
+        state = structs.CarState(vEgo=4.9 if blocked == 'low_speed' else 20.,
                                  aEgo=-.3 if blocked == 'response' else -.45,
                                  canValid=blocked != 'invalid_can', brakePressed=blocked == 'brake_pedal')
         now = 2_000_000_000
@@ -3141,7 +3567,6 @@ assert response.update(60, 7, 0.0, -0.2, True, True) == -0.2
         self.assertEqual(values['GAS_COMMAND'], -30000)
         self.assertAlmostEqual(values['ACCEL_COMMAND'], control.actuators.accel, delta=.01)
         self.assertAlmostEqual(output.accel, control.actuators.accel, delta=.00001)
-        self.assertFalse(controller.odyssey_coast_response.warmup)
 
   def test_brake_release_requires_coast_to_supply_requested_deceleration(self):
     for coast_error in (None, -.01, 0., .001, .1, .19):
@@ -3164,7 +3589,7 @@ assert response.update(60, 7, 0.0, -0.2, True, True) == -0.2
         CS = CarState(CP, _sp(CP))
         parsers = CS.get_can_parsers(CP, _sp(CP))
         CS.update(parsers)
-        CS.out = structs.CarState(vEgo=7.5 if blocked == 'low_speed' else 20., canValid=blocked != 'invalid_can',
+        CS.out = structs.CarState(vEgo=4.9 if blocked == 'low_speed' else 20., canValid=blocked != 'invalid_can',
                                   gasPressed=blocked == 'gas_pedal', brakePressed=blocked == 'brake_pedal')
         control = structs.CarControl(longActive=True, enabled=True)
         forecast_case = blocked in ('strong_coast', 'coast_shortfall', 'coast_weak', 'coast_sufficient', 'stale_gear', 'missing_gear',
@@ -3212,16 +3637,6 @@ assert response.update(60, 7, 0.0, -0.2, True, True) == -0.2
               _, sends = controller.update(control.as_reader(), structs.CarControlSP(), CS, now)
               output_parser.update([(now, [msg for msg in sends if msg[0] == 0x1DF])])
             self.assertEqual(output_parser.vl['ACC_CONTROL']['BRAKE_REQUEST'], blocked == 'coast_shortfall' and request < .3)
-
-  def test_uphill_negative_gas_demand_delays_only_an_active_gas_release(self):
-    gas_accel = odyssey_grade_gas_accel(-0.23, 0.03)
-    self.assertEqual(odyssey_command_domains(-0.23, 20.0, previous_gas=True, gas_accel=gas_accel), (True, False))
-    self.assertEqual(odyssey_command_domains(-0.23, 20.0, gas_accel=gas_accel), (False, False))
-    self.assertEqual(odyssey_command_domains(-0.23, 20.0, previous_gas=True, gas_accel=-0.23), (False, False))
-    self.assertEqual(odyssey_command_domains(-0.23, 20.0, previous_gas=True,
-                                              gas_accel=odyssey_grade_gas_accel(-0.23, 0.01)), (False, False))
-    self.assertEqual(odyssey_command_domains(-0.23, 20.0, previous_gas=True,
-                                              gas_accel=odyssey_grade_gas_accel(-0.23, 0.07)), (True, False))
 
   def test_road_brake_wire_preserves_request_across_grade_and_response(self):
     CP = CarInterface.get_params(CAR.HONDA_ODYSSEY_5G_MMR, gen_empty_fingerprint(), [], True, False, False)
@@ -3290,7 +3705,7 @@ assert response.update(60, 7, 0.0, -0.2, True, True) == -0.2
   def test_load_preset_raises_issued_gas_within_map_limit(self):
     CP = CarInterface.get_params(CAR.HONDA_ODYSSEY_5G_MMR, gen_empty_fingerprint(), [], True, False, False)
     dbc = DBC[CP.carFingerprint][Bus.pt]
-    gas_max = CarControllerParams.BOSCH_GAS_LOOKUP_V[-1]
+    gas_max = CarControllerParams(CP).BOSCH_GAS_LOOKUP_V[-1]
 
     def issued_gas(factor, accel, pitch=0.):
       with patch.object(CarController, "_read_odyssey_load_factor", lambda self: factor):

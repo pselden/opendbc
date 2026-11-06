@@ -49,6 +49,9 @@ class CarControllerParams:
     self.STEER_LOOKUP_BP = [v * -1 for v in CP.lateralParams.torqueBP][1:][::-1] + list(CP.lateralParams.torqueBP)
     self.STEER_LOOKUP_V = [v * -1 for v in CP.lateralParams.torqueV][1:][::-1] + list(CP.lateralParams.torqueV)
     if CP.carFingerprint == CAR.HONDA_ODYSSEY_5G_MMR:
+      # Keep Odyssey calibration independent of other Honda interfaces in this process.
+      self.BOSCH_GAS_LOOKUP_BP = [-0.2, 2.0]
+      self.BOSCH_GAS_LOOKUP_V = [0, 2000]
       # brikowski/opendbc Odyssey port: STEER_MAX 3840 comes from the interface torque map
       self.STEER_DELTA_UP = 2
       self.STEER_DELTA_DOWN = 2

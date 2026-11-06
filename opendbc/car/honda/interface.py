@@ -248,10 +248,6 @@ class CarInterface(CarInterfaceBase):
       ret.lateralTuning.torque.latAccelFactor *= 1.5
       ret.lateralTuning.torque.friction /= 1.5
       ret.steerActuatorDelay = 0.15
-      # brikowski/opendbc Odyssey port: the command-following controller is built on comma's gas map,
-      # which starts at -0.2 m/s^2 (MVL's shared Bosch map starts at 0.0)
-      CarControllerParams.BOSCH_GAS_LOOKUP_BP = [-0.2, 2.0]
-      CarControllerParams.BOSCH_GAS_LOOKUP_V = [0, 2000]
       if not ret.openpilotLongitudinalControl:
         # When using stock ACC, the radar intercepts and filters steering commands the EPS would otherwise accept
         ret.minSteerSpeed = 70. * CV.KPH_TO_MS
