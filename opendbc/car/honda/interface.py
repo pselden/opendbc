@@ -23,6 +23,14 @@ class CarInterface(CarInterfaceBase):
   DRIVABLE_GEARS = (structs.CarState.GearShifter.sport, structs.CarState.GearShifter.brake,)
 
   @staticmethod
+  def configure_torque_tune(candidate, tune, steering_angle_deadzone_deg=0.0):
+    CarInterfaceBase.configure_torque_tune(candidate, tune, steering_angle_deadzone_deg)
+    if candidate == CAR.HONDA_ODYSSEY_5G_MMR:
+      scale = CarControllerParams(structs.CarParams(carFingerprint=candidate)).STEER_MAX / 2560
+      tune.torque.latAccelFactor *= scale
+      tune.torque.friction /= scale
+
+  @staticmethod
   def get_pid_accel_limits(CP, CP_SP, current_speed, cruise_speed):
     if CP.carFingerprint in HONDA_BOSCH:
       return CarControllerParams.BOSCH_ACCEL_MIN, CarControllerParams.BOSCH_ACCEL_MAX
@@ -210,11 +218,9 @@ class CarInterface(CarInterfaceBase):
       ret.lateralTuning.pid.kpV, ret.lateralTuning.pid.kiV = [[0.6], [0.18]] # TODO: can probably use some tuning
 
     elif candidate == CAR.HONDA_ODYSSEY_5G_MMR:
-      ret.lateralTuning.pid.kpV, ret.lateralTuning.pid.kiV = [[0.2], [0.06]]
+      CarInterface.configure_torque_tune(candidate, ret.lateralTuning)
       ret.steerActuatorDelay = 0.15
-      CarControllerParams.BOSCH_GAS_LOOKUP_V = [0, 2000]
       if not ret.openpilotLongitudinalControl:
-        # When using stock ACC, the radar intercepts and filters steering commands the EPS would otherwise accept
         ret.minSteerSpeed = 70. * CV.KPH_TO_MS
 
     elif candidate == CAR.ACURA_MDX_4G:
@@ -261,6 +267,9 @@ class CarInterface(CarInterfaceBase):
     if candidate == CAR.HONDA_PILOT_4G:
       CarControllerParams.BOSCH_GAS_LOOKUP_V = [0, 2200]
 
+    if candidate == CAR.HONDA_ODYSSEY_5G_MMR:
+      ret.longitudinalActuatorDelay = 0.5
+
     # These cars use alternate user brake msg (0x1BE)
     if 0x1BE in fingerprint[CAN.pt] and ret.flags & HondaFlags.BOSCH:
       ret.flags |= HondaFlags.BOSCH_ALT_BRAKE.value
@@ -271,6 +280,8 @@ class CarInterface(CarInterfaceBase):
       ret.safetyConfigs[-1].safetyParam |= HondaSafetyFlags.NIDEC_ALT.value
     if ret.openpilotLongitudinalControl and ret.flags & HondaFlags.BOSCH:
       ret.safetyConfigs[-1].safetyParam |= HondaSafetyFlags.BOSCH_LONG.value
+      if candidate == CAR.HONDA_ODYSSEY_5G_MMR:
+        ret.safetyConfigs[-1].safetyParam |= HondaSafetyFlags.ODYSSEY_LONG.value
     if ret.flags & HondaFlags.BOSCH_RADARLESS:
       ret.safetyConfigs[-1].safetyParam |= HondaSafetyFlags.RADARLESS.value
     if candidate == CAR.ACURA_INTEGRA:

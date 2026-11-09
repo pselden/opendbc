@@ -41,6 +41,10 @@ class CarControllerParams:
   STEER_GLOBAL_MIN_SPEED = 3 * CV.MPH_TO_MS
 
   def __init__(self, CP):
+    if CP.carFingerprint == CAR.HONDA_ODYSSEY_5G_MMR:
+      self.STEER_DELTA_UP = self.STEER_DELTA_DOWN = 3 * 2560 / 4096
+      self.BOSCH_GAS_LOOKUP_BP = [-0.2, 2.0]
+      self.BOSCH_GAS_LOOKUP_V = [0, 2000]
     if CP.carFingerprint in (CAR.ACURA_TLX_1G, CAR.HONDA_ACCORD_9G):
       self.STEER_MAX = 239
     elif CP.carFingerprint == CAR.ACURA_MDX_3G:
@@ -74,6 +78,7 @@ class CarControllerParams:
 
 
 class HondaSafetyFlags(IntFlag):
+  ODYSSEY_LONG = 256
   ALT_BRAKE = 1
   BOSCH_LONG = 2
   NIDEC_ALT = 4
@@ -341,7 +346,7 @@ class CAR(Platforms):
     [HondaCarDocs("Honda Odyssey 2021-26", "All", min_steer_speed=70. * CV.KPH_TO_MS)],
     CarSpecs(wheelbase=3.00, steerRatio=19.4, centerToFrontRatio=0.41),
     {Bus.pt: 'acura_rdx_2020_can_generated'},
-    flags=HondaFlags.BOSCH_ALT_RADAR,
+    flags=HondaFlags.BOSCH_ALT_BRAKE | HondaFlags.BOSCH_ALT_RADAR,
   )
   ACURA_TLX_2G = HondaBoschPlatformConfig(
     [HondaCarDocs("Acura TLX 2021-23", "All")],

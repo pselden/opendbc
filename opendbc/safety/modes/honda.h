@@ -58,6 +58,7 @@ static bool honda_brake_switch_prev = false;
 static bool honda_alt_brake_msg = false;
 static bool honda_fwd_brake = false;
 static bool honda_bosch_long = false;
+static bool honda_bosch_odyssey_long = false;
 static bool honda_bosch_radarless = false;
 static bool honda_bosch_canfd = false;
 static bool honda_nidec_hybrid = false;
@@ -267,6 +268,14 @@ static bool honda_tx_hook(const CANPacket_t *msg) {
     .inactive_gas = -30000,
   };
 
+  const LongitudinalLimits HONDA_BOSCH_ODYSSEY_LONG_LIMITS = {
+    .max_accel = 200,
+    .min_accel = -350,
+    .max_gas = 2000,
+    .min_gas = -60,
+    .inactive_gas = -30000,
+  };
+
   const LongitudinalLimits HONDA_NIDEC_LONG_LIMITS = {
     .max_gas = 198,  // 0xc6
     .max_brake = 255,
@@ -357,8 +366,9 @@ static bool honda_tx_hook(const CANPacket_t *msg) {
     gas = to_signed(gas, 16);
 
     bool violation = false;
-    violation |= longitudinal_accel_checks(accel, HONDA_BOSCH_LONG_LIMITS);
-    violation |= longitudinal_gas_checks(gas, HONDA_BOSCH_LONG_LIMITS);
+    const LongitudinalLimits limits = honda_bosch_odyssey_long ? HONDA_BOSCH_ODYSSEY_LONG_LIMITS : HONDA_BOSCH_LONG_LIMITS;
+    violation |= longitudinal_accel_checks(accel, limits);
+    violation |= longitudinal_gas_checks(gas, limits);
 
     // AEB: block all actuation
     violation |= GET_BIT(msg, 33U);  // AEB_STATUS
@@ -495,6 +505,7 @@ static safety_config honda_nidec_init(uint16_t param) {
   honda_fwd_brake = false;
   honda_alt_brake_msg = false;
   honda_bosch_long = false;
+  honda_bosch_odyssey_long = false;
   honda_bosch_radarless = false;
   honda_bosch_canfd = false;
   honda_no_engine_data_msg = false;
@@ -701,6 +712,8 @@ static safety_config honda_bosch_init(uint16_t param) {
 #ifdef ALLOW_DEBUG
   const uint16_t HONDA_PARAM_BOSCH_LONG = 2;
   honda_bosch_long = GET_FLAG(param, HONDA_PARAM_BOSCH_LONG);
+  const uint16_t HONDA_PARAM_ODYSSEY_LONG = 256;
+  honda_bosch_odyssey_long = GET_FLAG(param, HONDA_PARAM_ODYSSEY_LONG);
 #endif
 
   safety_config ret;

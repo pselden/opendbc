@@ -13,6 +13,7 @@ from opendbc.car import ACCELERATION_DUE_TO_GRAVITY, Bus, DT_CTRL, rate_limit, m
 from opendbc.car.honda import hondacan
 from opendbc.car.honda.values import CAR, CruiseButtons, HondaFlags, CarControllerParams, CruiseSettings
 from opendbc.car.interfaces import CarControllerBase
+from opendbc.car.common.filter_simple import FirstOrderFilter
 from opendbc.car.common.pid import PIDController
 from opendbc.car.honda import lane_path
 from opendbc.car.honda import hud_objects
@@ -23,6 +24,8 @@ from opendbc.sunnypilot.car.honda.gas_interceptor import GasInterceptorCarContro
 from opendbc.sunnypilot.car.honda.icbm import IntelligentCruiseButtonManagementInterface
 from opendbc.sunnypilot.car.honda.eps_mod import EpsModCarController
 from opendbc.sunnypilot.car.honda.values_ext import HondaFlagsSP
+
+from opendbc.car.honda import odyssey
 
 VisualAlert = structs.CarControl.HUDControl.VisualAlert
 LongCtrlState = structs.CarControl.Actuators.LongControlState
@@ -301,6 +304,18 @@ class CarController(CarControllerBase, MadsCarController, GasInterceptorCarContr
     self.bosch_last_gas = 0
     self.last_applied_brake = 0.0
 
+    # brikowski/opendbc Odyssey command-following controller state
+    self.odyssey_brake_selected = False
+    self.odyssey_brake_start_frame = None
+    self.odyssey_gas_selected = False
+    self.odyssey_gas_bridge_active = False
+    self.odyssey_gas_response = odyssey.OdysseyGasResponse()
+    self.odyssey_brake_response_error = FirstOrderFilter(0.0, odyssey.ODYSSEY_RESPONSE_ERROR_TAU, DT_CTRL * 2)
+    self.odyssey_coast_response = odyssey.OdysseyCoastResponse()
+    self.odyssey_gas_coast_release = odyssey.OdysseyGasCoastRelease()
+    self.odyssey_pitch = FirstOrderFilter(0.0, odyssey.ODYSSEY_GRADE_FILTER_TAU, DT_CTRL)
+    self.odyssey_load_factor = self._read_odyssey_load_factor()
+
     self.lkas_button_send_remaining = 0
     self.last_lkas_button_frame = 0
     self.radar_disable_counter = 0
@@ -476,6 +491,15 @@ class CarController(CarControllerBase, MadsCarController, GasInterceptorCarContr
       "60": 1.0 if (Params().get("HondaLatAccelFactor60Params") is None) else Params().get("HondaLatAccelFactor60Params")
     }
 
+  def _read_odyssey_load_factor(self):
+    if self.CP.carFingerprint != CAR.HONDA_ODYSSEY_5G_MMR:
+      return 1.0
+    try:
+      return odyssey.odyssey_load_factor(Params().get(odyssey.ODYSSEY_LOAD_PRESET_PARAM))
+    except Exception:
+      # an unreadable or unregistered param must never stop the controller; fall back to the tuned empty van
+      return 1.0
+
   def update(self, CC, CC_SP, CS, now_nanos):
     MadsCarController.update(self, self.CP, CC, CC_SP)
     gas_pedal_force = 0.0
@@ -486,8 +510,17 @@ class CarController(CarControllerBase, MadsCarController, GasInterceptorCarContr
     else:
       hud_v_cruise = hud_control.setSpeed / CS.v_cruise_factor if hud_control.speedVisible else 255
     pcm_cancel_cmd = CC.cruiseControl.cancel
+    odyssey_pitch_valid = (self.CP.carFingerprint == CAR.HONDA_ODYSSEY_5G_MMR and
+                           len(CC.orientationNED) == 3 and math.isfinite(CC.orientationNED[1]))
+    if self.frame % odyssey.ODYSSEY_LOAD_REFRESH_FRAMES == 0:
+      self.odyssey_load_factor = self._read_odyssey_load_factor()
+    if odyssey_pitch_valid:
+      self.odyssey_pitch.update(CC.orientationNED[1])
+    elif self.CP.carFingerprint == CAR.HONDA_ODYSSEY_5G_MMR:
+      # Invalid pose must not poison the grade filter or a subsequent Honda command.
+      self.odyssey_pitch = FirstOrderFilter(0.0, odyssey.ODYSSEY_GRADE_FILTER_TAU, DT_CTRL)
 
-    if len(CC.orientationNED) == 3:
+    if len(CC.orientationNED) == 3 and math.isfinite(CC.orientationNED[1]):
       self.pitch = CC.orientationNED[1]
     hill_brake = math.sin(self.pitch) * ACCELERATION_DUE_TO_GRAVITY
     # Nidec: within this margin of the displayed set speed the PCM's own governor owns the
@@ -584,6 +617,13 @@ class CarController(CarControllerBase, MadsCarController, GasInterceptorCarContr
       brake = 0.0
       accel = 0.0
       gas, brake = 0.0, 0.0
+      self.odyssey_brake_selected = False
+      self.odyssey_brake_start_frame = None
+      self.odyssey_gas_selected = False
+      self.odyssey_gas_bridge_active = False
+      self.odyssey_gas_response.reset()
+      self.odyssey_brake_response_error.x = 0.0
+      self.odyssey_gas_coast_release.reset()
 
     if CC.longActive and not (self.CP.flags & HondaFlags.BOSCH):
       accel = self.accel
@@ -591,7 +631,8 @@ class CarController(CarControllerBase, MadsCarController, GasInterceptorCarContr
       self.nidec_pid.reset()
 
     # *** rate limit steer ***
-    limited_torque = rate_limit(actuators.torque, self.last_torque, -self.params.STEER_DELTA_DOWN * DT_CTRL,
+    previous_torque = self.last_torque
+    limited_torque = rate_limit(actuators.torque, previous_torque, -self.params.STEER_DELTA_DOWN * DT_CTRL,
                                 self.params.STEER_DELTA_UP * DT_CTRL)
     if (self.CP.carFingerprint == CAR.ACURA_MDX_3G) and \
         (self.apply_brake_last > 0 or self.new_accel < 1e-5): # lower steer limits while braking
@@ -622,6 +663,16 @@ class CarController(CarControllerBase, MadsCarController, GasInterceptorCarContr
         self.latFactors[currentLatSpeed] /= 1.001
       if abs(limited_torque) < 0.9 and self.latFactors[currentLatSpeed] < abs(CS.out.steeringAngleDeg):
         self.latFactors[currentLatSpeed] *= 1.001
+
+    if self.CP.carFingerprint == CAR.HONDA_ODYSSEY_5G_MMR:
+      # brikowski ody-op-test cef93020: the full 4096 range is always available. The tune is rescaled in the
+      # interface, so counts per m/s^2 and the slew in counts per frame are the stock 2560-range values.
+      requested = float(np.clip(-actuators.torque, -1.0, 1.0)) * self.params.STEER_MAX
+      physical_slew = self.params.STEER_DELTA_UP * DT_CTRL * self.params.STEER_MAX
+      limited_command = rate_limit(requested, -previous_torque * self.params.STEER_MAX,
+                                   -physical_slew, physical_slew) if CC.latActive else 0.0
+      apply_torque = int(limited_command)
+      self.last_torque = -limited_command / self.params.STEER_MAX
 
     # Send CAN commands
     can_sends = []
@@ -1121,66 +1172,215 @@ class CarController(CarControllerBase, MadsCarController, GasInterceptorCarContr
         ts = self.frame * DT_CTRL
 
         if self.CP.flags & HondaFlags.BOSCH:
-          if (accel < 1e-3) and (CS.out.vEgo < 3.0) and not (-1e-3 < CS.out.vEgo < 1e-3):
-            brake_addon = self.brake_pid.update(error = accel - CS.out.aEgo, speed = CS.out.vEgo)
-            targetaccel = min(accel,accel + brake_addon)
-          else:
-            if self.brake_pid.i < 0.0:
-              self.brake_pid.i = min(0.0, self.brake_pid.i + 0.02) # release 1m/s2 @ 50hz
+          if self.CP.carFingerprint != CAR.HONDA_ODYSSEY_5G_MMR:
+            if (accel < 1e-3) and (CS.out.vEgo < 3.0) and not (-1e-3 < CS.out.vEgo < 1e-3):
+              brake_addon = self.brake_pid.update(error = accel - CS.out.aEgo, speed = CS.out.vEgo)
+              targetaccel = min(accel,accel + brake_addon)
             else:
-              self.brake_pid.reset()
-            targetaccel = min(accel,accel + self.brake_pid.i)
-          if actuators.longControlState == LongCtrlState.stopping:  # simulate the old stoppingDecelRate of 0.1 m/s^2/s @ 50hz
-            targetaccel = max(targetaccel, self.last_applied_brake - 0.002)
-          self.last_applied_brake = targetaccel
-          self.accel = float(np.clip(targetaccel, self.params.BOSCH_ACCEL_MIN, self.params.BOSCH_ACCEL_MAX))
-          gas_pedal_force = targetaccel + wind_brake_ms2 * self.windfactor + hill_brake + self.gasalpha
-
-          # live-learn gas pedal adjustments when openpilot is controlling gas
-          if (actuators.longControlState == LongCtrlState.pid) and (not CS.out.gasPressed):
-            gas_error = accel - CS.out.aEgo
-            if self.CP.carFingerprint in (CAR.HONDA_INSIGHT, CAR.HONDA_CIVIC_BOSCH): # gas pedal reacts too slowly
-              learn_speed = 150
-            elif self.CP.carFingerprint in (CAR.ACURA_RDX_3G, CAR.ACURA_RDX_3G_MMR): # Prevent overreacting to turbo lag
-              learn_speed = 300
-            else:
-              learn_speed = 50
-            if gas_error != 0.0 and gas_pedal_force > 0:
-              self.gasfactor = np.clip(self.gasfactor + gas_error / learn_speed * gas_pedal_force, 0.01, 3.0)
-            if (-0.5 < gas_pedal_force - self.gasalpha < 0.1) and (CS.out.vEgo > 1.0):
-              self.gasalpha = float(np.clip(self.gasalpha + gas_error / learn_speed / 10.0, 0.0, 0.4))
-            if gas_error != 0.0 and (not CS.out.brakePressed) and (CS.out.vEgo > 0.0):
-              if self.CP.carFingerprint in (CAR.ACURA_RDX_3G, CAR.ACURA_RDX_3G_MMR): # Faster reaction
-                wind_learn_speed = 100
+              if self.brake_pid.i < 0.0:
+                self.brake_pid.i = min(0.0, self.brake_pid.i + 0.02) # release 1m/s2 @ 50hz
               else:
-                wind_learn_speed = 1000
-              wind_adjust = 1 + wind_brake_ms2 / wind_learn_speed
-              self.windfactor = np.clip(self.windfactor * (wind_adjust if (gas_error > 0) else 1.0/wind_adjust), 0.1, 3.0)
-            if gas_pedal_force <= 0.0: # don't reduce windfactor while braking, allow increases
-              self.windfactor = max(self.windfactor, self.windfactor_before_brake)
-            else:
-              self.windfactor_before_brake = self.windfactor
-            if gas_pedal_force >= self.params.BOSCH_ACCEL_MAX: # don't increase gasfactor nor windfactor at accel max, allow decreases
-              self.gasfactor = min(self.gasfactor, self.gasfactor_before_gasmax)
-              self.windfactor = min(self.windfactor, self.windfactor_before_gasmax)
-            else:
-              self.gasfactor_before_gasmax = self.gasfactor
-              self.windfactor_before_gasmax = self.windfactor
-          self.gas = float(np.interp((gas_pedal_force) * self.gasfactor,
-                                     [0, self.params.BOSCH_GAS_LOOKUP_BP[1]], self.params.BOSCH_GAS_LOOKUP_V))
+                self.brake_pid.reset()
+              targetaccel = min(accel,accel + self.brake_pid.i)
+            if actuators.longControlState == LongCtrlState.stopping:  # simulate the old stoppingDecelRate of 0.1 m/s^2/s @ 50hz
+              targetaccel = max(targetaccel, self.last_applied_brake - 0.002)
+            self.last_applied_brake = targetaccel
+            self.accel = float(np.clip(targetaccel, self.params.BOSCH_ACCEL_MIN, self.params.BOSCH_ACCEL_MAX))
+            gas_pedal_force = targetaccel + wind_brake_ms2 * self.windfactor + hill_brake + self.gasalpha
 
-          # limit gas ramp to 60 units per frame, matches stock.  Higher sometimes causes powertrain to ignore gas command.
-          max_gas = max(60, self.bosch_last_gas + 60)
-          self.gas = min(self.gas, max_gas)
-          self.bosch_last_gas = self.gas
+            # live-learn gas pedal adjustments when openpilot is controlling gas
+            if (actuators.longControlState == LongCtrlState.pid) and (not CS.out.gasPressed):
+              gas_error = accel - CS.out.aEgo
+              if self.CP.carFingerprint in (CAR.HONDA_INSIGHT, CAR.HONDA_CIVIC_BOSCH): # gas pedal reacts too slowly
+                learn_speed = 150
+              elif self.CP.carFingerprint in (CAR.ACURA_RDX_3G, CAR.ACURA_RDX_3G_MMR): # Prevent overreacting to turbo lag
+                learn_speed = 300
+              else:
+                learn_speed = 50
+              if gas_error != 0.0 and gas_pedal_force > 0:
+                self.gasfactor = np.clip(self.gasfactor + gas_error / learn_speed * gas_pedal_force, 0.01, 3.0)
+              if (-0.5 < gas_pedal_force - self.gasalpha < 0.1) and (CS.out.vEgo > 1.0):
+                self.gasalpha = float(np.clip(self.gasalpha + gas_error / learn_speed / 10.0, 0.0, 0.4))
+              if gas_error != 0.0 and (not CS.out.brakePressed) and (CS.out.vEgo > 0.0):
+                if self.CP.carFingerprint in (CAR.ACURA_RDX_3G, CAR.ACURA_RDX_3G_MMR): # Faster reaction
+                  wind_learn_speed = 100
+                else:
+                  wind_learn_speed = 1000
+                wind_adjust = 1 + wind_brake_ms2 / wind_learn_speed
+                self.windfactor = np.clip(self.windfactor * (wind_adjust if (gas_error > 0) else 1.0/wind_adjust), 0.1, 3.0)
+              if gas_pedal_force <= 0.0: # don't reduce windfactor while braking, allow increases
+                self.windfactor = max(self.windfactor, self.windfactor_before_brake)
+              else:
+                self.windfactor_before_brake = self.windfactor
+              if gas_pedal_force >= self.params.BOSCH_ACCEL_MAX: # don't increase gasfactor nor windfactor at accel max, allow decreases
+                self.gasfactor = min(self.gasfactor, self.gasfactor_before_gasmax)
+                self.windfactor = min(self.windfactor, self.windfactor_before_gasmax)
+              else:
+                self.gasfactor_before_gasmax = self.gasfactor
+                self.windfactor_before_gasmax = self.windfactor
+            self.gas = float(np.interp((gas_pedal_force) * self.gasfactor,
+                                       [0, self.params.BOSCH_GAS_LOOKUP_BP[1]], self.params.BOSCH_GAS_LOOKUP_V))
 
-          stopping = actuators.longControlState == LongCtrlState.stopping and self.accel <= 0.0
+            # limit gas ramp to 60 units per frame, matches stock.  Higher sometimes causes powertrain to ignore gas command.
+            max_gas = max(60, self.bosch_last_gas + 60)
+            self.gas = min(self.gas, max_gas)
+            self.bosch_last_gas = self.gas
+
+          else:
+            # brikowski/opendbc Odyssey command-following controller (domains selected below)
+            previous_accel = self.accel
+            self.accel = float(np.clip(accel, self.params.BOSCH_ACCEL_MIN, self.params.BOSCH_ACCEL_MAX))
+            previous_gas_command = self.gas
+            self.gas = float(np.interp(odyssey.odyssey_load_gas_accel(accel, self.odyssey_load_factor),
+                                       self.params.BOSCH_GAS_LOOKUP_BP, self.params.BOSCH_GAS_LOOKUP_V))
+          stopping = (actuators.longControlState == LongCtrlState.stopping and
+                      (self.CP.carFingerprint == CAR.HONDA_ODYSSEY_5G_MMR or self.accel <= 0.0))
+          gas_domain = None
+          brake_domain = None
+          if self.CP.carFingerprint == CAR.HONDA_ODYSSEY_5G_MMR:
+            previous_gas = self.odyssey_gas_selected
+            # Inactive brake feedback represents passive response only after the command settles.
+            settled_brake = ((self.odyssey_brake_selected or self.odyssey_coast_response.gear == CS.odyssey_target_gear) and
+                             self.odyssey_brake_start_frame is not None and
+                             self.frame - self.odyssey_brake_start_frame >= 2 * odyssey.ODYSSEY_RESPONSE_DELAY_FRAMES)
+            gear_state_valid = (CS.out.canValid and CS.odyssey_target_gear_ts_nanos > 0 and
+                                0 <= now_nanos - CS.odyssey_target_gear_ts_nanos < 60_000_000)
+            coast_state_valid = (gear_state_valid and
+                                 CS.odyssey_computer_braking_ts_nanos > 0 and
+                                 0 <= now_nanos - CS.odyssey_computer_braking_ts_nanos < 60_000_000)
+            coast_inputs_valid = (coast_state_valid and odyssey_pitch_valid and
+                                  0 <= now_nanos - CS.odyssey_engine_torque_ts_nanos < 60_000_000)
+            coast_observation_eligible = not CS.out.gasPressed and not CS.out.brakePressed and coast_inputs_valid
+            coast_eligible = CC.longActive and actuators.longControlState == LongCtrlState.pid and coast_observation_eligible
+            manual_coast_eligible = (not CC.longActive and 8.0 <= CS.out.vEgo <= 35.0 and
+                                     abs(CS.odyssey_user_brake) <= 0.015625 and coast_observation_eligible)
+            if not coast_inputs_valid:
+              self.odyssey_coast_response.reset()
+            # Brake feedback can remain active when the computer-braking indication drops.
+            brake_feedback_active = (CS.odyssey_computer_braking or
+                                     (math.isfinite(CS.odyssey_user_brake) and CS.odyssey_user_brake > 0.015625))
+            if self.odyssey_coast_response.gear != CS.odyssey_target_gear:
+              self.odyssey_brake_response_error.x = 0.0
+            passive_accel = self.odyssey_coast_response.update(
+              self.frame, CS.odyssey_target_gear, CC.orientationNED[1] if odyssey_pitch_valid else 0.0, CS.out.aEgo,
+              # A nonnegative brake hold is controlled response, not a passive coast observation.
+              not previous_gas and (not self.odyssey_brake_selected or
+                                    (settled_brake and accel < 0.0)) and abs(CS.odyssey_user_brake) <= 0.015625 and
+              CS.odyssey_car_gas == 0.0 and
+              not CS.odyssey_computer_braking, (coast_eligible or manual_coast_eligible) and coast_state_valid)
+            response_excess = (self.odyssey_gas_response.drivetrain == (CS.odyssey_target_gear, CS.odyssey_shift_activity) and
+                               self.odyssey_gas_response.error.x < -odyssey.ODYSSEY_COAST_RELEASE_ERROR)
+            # GAS_COMMAND has one-count resolution and the CAN packer rounds half up.
+            release_gas = self.odyssey_gas_coast_release.update(
+              now_nanos, accel, CS.out.aEgo, CS.out.vEgo, self.odyssey_pitch.x,
+              CS.odyssey_target_gear, passive_accel, previous_gas,
+              coast_eligible and coast_state_valid, math.floor(previous_gas_command + 0.5) == 0,
+              response_excess and CS.odyssey_car_gas == 0.0 and not CS.odyssey_computer_braking and abs(CS.odyssey_user_brake) <= 0.015625,
+              odyssey_pitch_valid and CC.orientationNED[1] < 0.0 and self.odyssey_pitch.x < 0.0)
+            # A single wheel-acceleration dip must not override a settled coast forecast.
+            brake_error = accel - CS.out.aEgo
+            if (self.odyssey_brake_selected and coast_eligible and coast_state_valid and
+                passive_accel is not None and odyssey.ODYSSEY_LOW_SPEED_DOMAIN_VEGO <= CS.out.vEgo <= 35.0 and
+                CS.odyssey_car_gas == 0.0 and math.isfinite(CS.odyssey_user_brake) and math.isfinite(brake_error)):
+              self.odyssey_brake_response_error.update(brake_error)
+            else:
+              self.odyssey_brake_response_error.x = 0.0
+            release_brake = odyssey.odyssey_brake_release(
+              now_nanos, accel, CS.out.aEgo, self.odyssey_brake_selected, CS.odyssey_computer_braking_ts_nanos,
+              CS.odyssey_car_gas, CS.odyssey_target_gear,
+              coast_eligible and coast_state_valid and CS.out.vEgo >= odyssey.ODYSSEY_LOW_SPEED_DOMAIN_VEGO and
+              (not self.odyssey_brake_selected or brake_feedback_active),
+              passive_accel, settled_brake and accel >= previous_accel and
+              (not self.odyssey_brake_selected or self.odyssey_brake_response_error.x > odyssey.ODYSSEY_COAST_RELEASE_ERROR))
+            release_brake |= (settled_brake and accel > 0.0 and
+                              brake_error > odyssey.ODYSSEY_COAST_RELEASE_ERROR and
+                              self.odyssey_brake_response_error.x > odyssey.ODYSSEY_COAST_RELEASE_ERROR)
+            gas_accel = accel
+            cap_weight = 0.0
+            bridge_weight = 0.0
+            if (odyssey_pitch_valid and CC.orientationNED[1] * self.odyssey_pitch.x > 0.0 and
+                actuators.longControlState == LongCtrlState.pid and not CS.out.gasPressed):
+              gas_accel = odyssey.odyssey_grade_gas_accel(accel, self.odyssey_pitch.x)
+              bridge_weight = odyssey.odyssey_grade_weight(self.odyssey_pitch.x)
+            if actuators.longControlState == LongCtrlState.pid and not CS.out.gasPressed:
+              self.gas, cap_weight = odyssey.odyssey_gas_feedforward(accel, gas_accel, CS.out.vEgo, self.params, self.odyssey_load_factor)
+            passive_response_eligible = odyssey.ODYSSEY_LOW_SPEED_DOMAIN_VEGO <= CS.out.vEgo <= 35.0 and passive_accel is not None
+            coast_start = self.odyssey_coast_response.coast_start
+            settled_coast = (not self.odyssey_brake_selected and coast_start is not None and
+                             self.frame - coast_start >= 2 * odyssey.ODYSSEY_RESPONSE_DELAY_FRAMES)
+            response_gas = (passive_response_eligible and accel < 0.0 and passive_accel < accel and
+                           not CS.odyssey_computer_braking and
+                           ((previous_gas and (CS.out.aEgo <= accel + odyssey.ODYSSEY_COAST_RELEASE_ERROR or
+                                              (not response_excess and not self.odyssey_gas_bridge_active))) or
+                            (passive_accel < accel - odyssey.ODYSSEY_COAST_RELEASE_ERROR and
+                             CS.odyssey_car_gas == 0.0 and CS.out.aEgo < accel - odyssey.ODYSSEY_COAST_RELEASE_ERROR and
+                             (settled_coast or settled_brake))))
+            # Below the raw gas split, calibrated gas needs qualified live response for continuity.
+            response_gas |= (previous_gas and not self.odyssey_gas_bridge_active and
+                            coast_eligible and coast_state_valid and not brake_feedback_active and
+                            odyssey.ODYSSEY_LOW_SPEED_DOMAIN_VEGO <= CS.out.vEgo <= 35.0 and accel < 0.0 and
+                            (passive_accel is None or passive_accel < accel) and
+                            (self.odyssey_gas_response.correction > 0.0 or
+                             gas_accel > self.params.BOSCH_GAS_LOOKUP_BP[0]) and
+                            CS.out.aEgo <= accel + odyssey.ODYSSEY_COAST_RELEASE_ERROR)
+            if response_gas:
+              gas_selected, brake_selected = True, False
+              self.odyssey_gas_bridge_active = False
+            # A prior coast forecast and fresh response can establish brake need before the learning dwell.
+            elif (passive_response_eligible and not previous_gas and not self.odyssey_brake_selected and
+                  coast_start is not None and passive_accel > accel + odyssey.ODYSSEY_COAST_RELEASE_ERROR and
+                  CS.out.aEgo > accel + odyssey.ODYSSEY_COAST_RELEASE_ERROR):
+              gas_selected, brake_selected = False, True
+            else:
+              gas_selected, brake_selected = odyssey.odyssey_command_domains(accel, CS.out.vEgo,
+                                                                      self.odyssey_brake_selected,
+                                                                      previous_gas,
+                                                                      self.odyssey_gas_bridge_active,
+                                                                      gas_accel, release_brake, release_gas,
+                                                                      passive_accel if passive_response_eligible else None)
+            # A released brake command can precede the received brake feedback returning to idle.
+            waiting_for_brake_release = (gas_selected and not previous_gas and coast_eligible and coast_state_valid and
+                                         odyssey.ODYSSEY_LOW_SPEED_DOMAIN_VEGO <= CS.out.vEgo <= 35.0 and brake_feedback_active)
+            if waiting_for_brake_release:
+              gas_selected = False
+            # Keep settled brake history through qualified coast and the feedback wait.
+            if brake_selected and not self.odyssey_brake_selected:
+              self.odyssey_brake_start_frame = self.frame
+            elif not brake_selected and not (waiting_for_brake_release or (release_brake and settled_brake and not gas_selected)):
+              self.odyssey_brake_start_frame = None
+            self.odyssey_brake_selected = CC.longActive and brake_selected
+            self.odyssey_gas_selected = gas_selected
+            # Honda brake holds do not measure gas-only response.
+            feedback_state_valid = (CC.longActive and not self.odyssey_gas_bridge_active and odyssey_pitch_valid and
+                                    actuators.longControlState == LongCtrlState.pid and
+                                    not CS.out.gasPressed and not CS.out.brakePressed and
+                                    coast_state_valid and math.isfinite(CS.odyssey_user_brake) and not brake_feedback_active)
+            feedback_eligible = (feedback_state_valid and gas_selected and
+                                 (previous_gas or (accel >= 0.0 and self.odyssey_gas_response.integral < 0.0)) and
+                                 (gas_accel > self.params.BOSCH_GAS_LOOKUP_BP[0] or response_gas))
+            correction = self.odyssey_gas_response.update(accel, CS.out.aEgo, self.odyssey_pitch.x,
+                                                            CS.out.vEgo, CS.odyssey_target_gear, feedback_eligible,
+                                                            cap_weight, CS.odyssey_shift_activity,
+                                                            limits=(-self.gas, self.params.BOSCH_GAS_LOOKUP_V[-1] - self.gas),
+                                                            coast=feedback_state_valid and not gas_selected and not brake_selected)
+            if feedback_eligible:
+              self.gas = float(np.clip(self.gas + correction, 0.0, self.params.BOSCH_GAS_LOOKUP_V[-1]))
+            if CC.longActive and brake_selected and not CS.out.gasPressed and not CS.out.brakePressed:
+              self.accel = odyssey.odyssey_creep_brake_accel(self.accel, CS.out.vEgo)
+            # A qualified passive-response shortfall can use gas and existing feedback at the map floor.
+            self.gas, self.odyssey_gas_bridge_active = odyssey.odyssey_gas_command(accel, self.gas, gas_selected,
+                                                                            previous_gas or response_gas, self.odyssey_gas_bridge_active,
+                                                                            bridge_weight)
+            gas_domain = gas_selected
+            brake_domain = brake_selected
+
           self.stopping_counter = self.stopping_counter + 1 if stopping else 0
           # CAN FD: never overlap the stock radar's own ACC_CONTROL stream; ours starts within a few
           # frames of the radar going silent (see the deferred radar disable above)
           if not (self.CP.flags & HondaFlags.BOSCH_CANFD and CS.stock_acc_alive):
             can_sends.extend(hondacan.create_acc_commands(self.packer, self.CAN, CC.enabled, CC.longActive, self.accel, self.gas,
-                                                          self.stopping_counter, self.CP, gas_pedal_force))
+                                                          self.stopping_counter, self.CP, gas_pedal_force,
+                                                          gas_domain, brake_domain))
         elif not (self.CP_SP.flags & HondaFlagsSP.STOCK_LONGITUDINAL):
           apply_brake = np.clip(self.brake_last - wind_brake, 0.0, 1.0)
           if (apply_brake > 0) and (actuators.longControlState == LongCtrlState.pid) and (CS.out.vEgo > 1e-5) and (not CS.out.stockAeb):
@@ -1384,8 +1584,15 @@ class CarController(CarControllerBase, MadsCarController, GasInterceptorCarContr
                                                                        self.last_button_frame, self.CAN))
 
     new_actuators = actuators.as_builder()
-    new_actuators.torque = self.last_torque
-    if self.CP.flags & HondaFlags.BOSCH:
+    new_actuators.torque = -apply_torque / self.params.STEER_MAX if self.CP.carFingerprint == CAR.HONDA_ODYSSEY_5G_MMR else self.last_torque
+    if self.CP.carFingerprint == CAR.HONDA_ODYSSEY_5G_MMR:
+      # Odyssey port keeps upstream actuator semantics so logs compare directly with brikowski/openpilot
+      new_actuators.speed = self.speed
+      new_actuators.accel = self.accel
+      new_actuators.gas = self.gas
+      new_actuators.brake = self.brake
+      new_actuators.torqueOutputCan = apply_torque
+    elif self.CP.flags & HondaFlags.BOSCH:
       new_actuators.speed = float(self.gasalpha)
       new_actuators.accel = self.accel
       new_actuators.gas = float(self.gasfactor)

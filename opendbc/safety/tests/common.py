@@ -977,6 +977,8 @@ class SafetyTest(SafetyTestBase):
             # No point in comparing to ALLOUTPUT which allows all messages
             if attr.startswith('TestAllOutput'):
               continue
+            if {attr, current_test}.issubset({'TestHondaBoschLongSafety', 'TestHondaBoschLongOdysseySafety'}):
+              continue
             if attr.startswith('TestHondaBoschRadarlessLong') and current_test.startswith('TestHondaBoschRadarlessLong'):
               continue
             if attr.startswith('TestToyota') and current_test.startswith('TestToyota'):

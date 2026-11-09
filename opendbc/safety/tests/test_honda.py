@@ -842,6 +842,12 @@ class TestHondaBoschLongSafety(HondaButtonEnableBase, TestHondaBoschSafetyBase):
         msg = self.packer.make_can_msg_safety("ACC_CONTROL", self.PT_BUS, values)
         self.assertFalse(self._tx(msg), msg=aeb_signals)
       self.assertTrue(self._tx(self._send_gas_brake_msg(self.NO_GAS, 0)))
+class TestHondaBoschLongOdysseySafety(TestHondaBoschLongSafety, TestHondaBoschAltBrakeSafetyBase):
+  SAFETY_PARAM = HondaSafetyFlags.BOSCH_LONG | HondaSafetyFlags.ALT_BRAKE | HondaSafetyFlags.ODYSSEY_LONG
+  MAX_GAS = 2000
+  MIN_GAS = -60
+
+
 class TestHondaBoschRadarlessSafetyBase(TestHondaBoschSafetyBase):
   """Base class for radarless Honda Bosch"""
   DBC = "honda_bosch_radarless_generated"

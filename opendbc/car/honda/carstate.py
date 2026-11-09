@@ -62,6 +62,14 @@ class CarState(CarStateBase, CarStateExt):
     self.dash_speed_seen = False
     self.is_metric = False
     self.v_cruise_factor = 1.
+    self.odyssey_car_gas = np.nan
+    self.odyssey_engine_torque_ts_nanos = 0
+    self.odyssey_target_gear = 0
+    self.odyssey_shift_activity = 0
+    self.odyssey_target_gear_ts_nanos = 0
+    self.odyssey_computer_braking = False
+    self.odyssey_computer_braking_ts_nanos = 0
+    self.odyssey_user_brake = np.nan
 
     self.initial_accFault_cleared = False
     self.initial_accFault_cleared_timer = int(10 / DT_CTRL) # 10 seconds after startup for initial faults to clear
@@ -228,6 +236,17 @@ class CarState(CarStateBase, CarStateExt):
       ret.gearShifter = self.parse_gear_shifter(gear_position)
 
     ret.gasPressed = cp.vl["POWERTRAIN_DATA"]["PEDAL_GAS"] > 1e-5
+
+    if self.CP.carFingerprint == CAR.HONDA_ODYSSEY_5G_MMR:
+      gas_msg = cp.vl["GAS_PEDAL_2"]
+      self.odyssey_car_gas = gas_msg["CAR_GAS"]
+      self.odyssey_engine_torque_ts_nanos = cp.ts_nanos["GAS_PEDAL_2"]["ENGINE_TORQUE_ESTIMATE"]
+      self.odyssey_target_gear = cp.vl["GEARBOX_AUTO"]["TRANS_TARGET_GEAR"]
+      self.odyssey_shift_activity = cp.vl["GEARBOX_AUTO"]["TRANS_SHIFT_ACTIVITY"]
+      self.odyssey_target_gear_ts_nanos = cp.ts_nanos["GEARBOX_AUTO"]["TRANS_TARGET_GEAR"]
+      self.odyssey_computer_braking = bool(cp.vl["VSA_STATUS"]["COMPUTER_BRAKING"])
+      self.odyssey_computer_braking_ts_nanos = cp.ts_nanos["VSA_STATUS"]["COMPUTER_BRAKING"]
+      self.odyssey_user_brake = cp.vl["VSA_STATUS"]["USER_BRAKE"]
 
     ret.steeringTorque = cp.vl[self.steer_status_msg]["STEER_TORQUE_SENSOR"]
     ret.steeringPressed = abs(ret.steeringTorque) > STEER_THRESHOLD.get(self.CP.carFingerprint, 1200)

@@ -76,13 +76,20 @@ def create_brake_command(packer, CAN, apply_brake, pump_on, pcm_override, pcm_ca
   return packer.make_can_msg("BRAKE_COMMAND", CAN.pt, values)
 
 
-def create_acc_commands(packer, CAN, enabled, active, accel, gas, stopping_counter, CP, gas_force):
+def create_acc_commands(packer, CAN, enabled, active, accel, gas, stopping_counter, CP, gas_force,
+                        gas_selected=None, brake_selected=None):
   commands = []
 
+  # Odyssey (brikowski port) selects the gas/brake domain explicitly; other cars derive it from gas_force.
+  if gas_selected is None:
+    gas_selected = gas_force > 0
+  if brake_selected is None:
+    brake_selected = gas_force < 0
+
   control_on = 5 if enabled else 0
-  gas_command = gas if active and gas_force > 0 else -30000
+  gas_command = gas if active and gas_selected else -30000
   accel_command = accel if active else 0
-  braking = 1 if active and gas_force < 0 else 0
+  braking = 1 if active and brake_selected else 0
   standstill = 1 if active and stopping_counter > 0 else 0
   standstill_release = 1 if active and stopping_counter == 0 else 0
 
@@ -207,8 +214,28 @@ def create_lkas_hud(packer, bus, CP, hud_control, lat_active, steering_available
 
     if CP.flags & (HondaFlags.BOSCH_RADARLESS | HondaFlags.BOSCH_CANFD):
       lkas_hud_values['LKAS_PROBLEM'] = CS.out.steerFaultPermanent # CS.lkas_hud['LKAS_PROBLEM']
+      if CP.flags & HondaFlags.BOSCH_RADARLESS:
+        lkas_hud_values['DASHED_LANES'] = 1  # show gray lanes when disengaged
+      else:
+        # CAN FD: dashed lanes are the MADS armed indication (MadsCarController sets dashed_lanes to
+        # mads.enabled and not latActive, which is not standstill-gated - so parked/standstill LKAS
+        # button presses produce cluster feedback; latActive alone stays 0 below 0.3 m/s and armed
+        # toggles would render nothing). ORed with lat_active while steering so the engaged payload
+        # keeps SOLID and DASHED set together (0x44), byte-matching the stock camera's lanes-on state.
+        lkas_hud_values['DASHED_LANES'] = dashed_lanes or lat_active
 
-  if (not (CP.flags & HondaFlags.BOSCH_EXT_HUD)) or (CP.flags & (HondaFlags.BOSCH_ALT_RADAR)):
+    if CP.flags & HondaFlags.BOSCH_CANFD:
+      # Don't let steer saturation flicker SOLID_LANES: every payload change must coincide with an
+      # LKAS_STATE_CHANGE pulse (see carcontroller), and a 10Hz flicker would keep the pulse
+      # re-triggering, which suppresses the dash lane lines.
+      # Keyed on lat_active, NOT hud_control.lanesVisible (== CC.enabled): under sunnypilot MADS
+      # the lateral control stays engaged when a brake press disengages ACC, and the dash LKAS
+      # indication must follow the lateral state or the driver can't tell MADS is still steering
+      # (drivers pressing the LKAS button to "re-engage" silently toggled MADS off). On forks
+      # without MADS, lat_active == enabled while moving, so this stays equivalent there.
+      lkas_hud_values['SOLID_LANES'] = lat_active
+
+  if not (CP.flags & HondaFlags.BOSCH_EXT_HUD):
     lkas_hud_values['RDM_OFF'] = 1
     lkas_hud_values['LANE_ASSIST_BEEP_OFF'] = 1
 
